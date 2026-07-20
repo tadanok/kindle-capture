@@ -1,0 +1,10 @@
+.DS_Store
+
+# Kindle キャプチャの生成物
+*.pdf
+kindle_tmp_pages/
+
+# ローカル環境・認証情報
+.venv/
+.env
+.env.*
