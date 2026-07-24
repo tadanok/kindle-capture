@@ -1,0 +1,10 @@
+# どの書籍でも比較的安全に認識候補へ加えられる技術用語
+AI
+API
+HTML
+JSON
+LLM
+OCR
+OpenAI
+SQL
+URL

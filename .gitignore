@@ -2,9 +2,16 @@
 
 # Kindle キャプチャの生成物
 *.pdf
+*_ocr.txt
+*_readaloud.txt
+*_ocr_quality.json
 kindle_tmp_pages/
+tmp/pdfs/
+ocr_models/
 
 # ローカル環境・認証情報
 .venv/
+__pycache__/
+*.pyc
 .env
 .env.*

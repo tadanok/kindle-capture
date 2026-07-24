@@ -1,0 +1,17 @@
+# AI・RAG関連書籍を処理するときだけ追加する専門用語
+Agentic
+Chunking
+ChunkRAG
+DeepResearch
+DeepSearch
+Generation
+GraphRAG
+Indexing
+LangChain
+LangSmith
+LLM-as-a-Judge
+RAG
+Ragas
+Rerank
+Retrieval
+Self-RAG
