@@ -11,14 +11,20 @@ from ocr_readaloud_plugin import (
     analyze_ocr_page,
     apply_common_ocr_corrections,
     choose_alternate_pagesegmode,
+    clean_manga_region_text,
     correct_common_ocr_misrecognitions,
     filter_figure_lines,
     filter_list_marker_words,
     filter_low_confidence_lines,
+    filter_manga_non_narrative_lines,
+    filter_manga_vision_titles,
     find_ocr_review_candidates,
+    merge_manga_ocr_pages,
     normalize_line_text,
     normalize_ocr_tree,
+    parse_vision_ocr_output,
     reorder_ocr_tree_by_position,
+    run_vision_ocr,
     should_accept_line_retry,
     should_retry_ocr,
 )
@@ -552,6 +558,159 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertEqual(noise.children, [])
         self.assertNotEqual(body.children, [])
+
+    def test_parses_macos_vision_boxes_and_text(self) -> None:
+        output = (
+            "0.100000\t0.200000\t0.300000\t0.100000\t"
+            "0.750000\t第1章 AIエージェント\n"
+        )
+
+        page, text = parse_vision_ocr_output(output, 1000, 2000)
+
+        lines = list(page.lines)
+        self.assertEqual(text, "第1章 AIエージェント")
+        self.assertEqual(len(lines), 1)
+        assert lines[0].bbox is not None
+        self.assertAlmostEqual(lines[0].bbox.left, 100)
+        self.assertAlmostEqual(lines[0].bbox.top, 1400)
+        self.assertAlmostEqual(lines[0].bbox.right, 400)
+        self.assertAlmostEqual(lines[0].bbox.bottom, 1600)
+        self.assertEqual(lines[0].children[0].confidence, 0.75)
+
+    def test_vision_ocr_is_disabled_without_an_explicit_helper(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            image_path = Path(directory) / "page.png"
+            Image.new("RGB", (100, 100), "white").save(image_path)
+
+            result = run_vision_ocr(image_path, 100, 100)
+
+        self.assertIsNone(result)
+
+    def test_manga_filter_keeps_titles_and_dialogue_but_removes_code(self) -> None:
+        title = self.make_line(
+            "第1章 AIエージェント",
+            0.98,
+            40,
+            height=55,
+        )
+        dialogue = self.make_line(
+            "これは吹き出しの本文です。",
+            0.95,
+            180,
+            height=30,
+        )
+        code = self.make_line(
+            "import { Router } from './api';",
+            0.90,
+            320,
+            height=14,
+        )
+        ui = self.make_line(
+            "Editor UI",
+            0.90,
+            360,
+            height=14,
+        )
+        page = OcrElement(
+            ocr_class=OcrClass.PAGE,
+            bbox=BoundingBox(0, 0, 600, 1000),
+            children=[
+                OcrElement(
+                    ocr_class=OcrClass.PARAGRAPH,
+                    children=[title, dialogue, code, ui],
+                )
+            ],
+        )
+        image = Image.new("RGB", (600, 1000), "white")
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((0, 135, 240, 255), outline="black", width=8)
+
+        removed = filter_manga_non_narrative_lines(page, image)
+
+        self.assertEqual(removed, 2)
+        self.assertTrue(title.children)
+        self.assertTrue(dialogue.children)
+        self.assertFalse(code.children)
+        self.assertFalse(ui.children)
+
+    def test_manga_vision_keeps_titles_without_screen_or_prop_text(self) -> None:
+        title = self.make_line("『第2世代：対話型』", 0.98, 220, height=30)
+        upper_caption = self.make_line(
+            "まずは三世代の話から",
+            0.95,
+            60,
+            height=30,
+        )
+        screen_code = self.make_line(
+            "CODE BASE",
+            0.95,
+            80,
+            height=30,
+        )
+        prop_text = self.make_line("辞令", 0.95, 700, height=50)
+        page = OcrElement(
+            ocr_class=OcrClass.PAGE,
+            bbox=BoundingBox(0, 0, 600, 1000),
+            children=[
+                OcrElement(
+                    ocr_class=OcrClass.PARAGRAPH,
+                    children=[title, upper_caption, screen_code, prop_text],
+                )
+            ],
+        )
+
+        removed = filter_manga_vision_titles(page)
+
+        self.assertEqual(removed, 2)
+        self.assertTrue(title.children)
+        self.assertTrue(upper_caption.children)
+        self.assertFalse(screen_code.children)
+        self.assertFalse(prop_text.children)
+
+    def test_cleans_vertically_spaced_manga_region_text(self) -> None:
+        self.assertEqual(
+            clean_manga_region_text("補 完 対 話 x →"),
+            "補完対話",
+        )
+
+    def test_merges_manga_ocr_and_removes_duplicate_title(self) -> None:
+        right = self.make_line("右の吹き出し", 0.90, 100, height=30)
+        assert right.bbox is not None
+        right.bbox = BoundingBox(350, 100, 550, 130)
+        title_one = self.make_line("第1章", 0.95, 20, height=40)
+        title_two = self.make_line("第1章", 0.90, 20, height=40)
+        left = self.make_line("左の吹き出し", 0.90, 100, height=30)
+        assert left.bbox is not None
+        left.bbox = BoundingBox(50, 100, 250, 130)
+
+        def make_page(lines: list[OcrElement]) -> OcrElement:
+            return OcrElement(
+                ocr_class=OcrClass.PAGE,
+                bbox=BoundingBox(0, 0, 600, 1000),
+                children=[
+                    OcrElement(
+                        ocr_class=OcrClass.PARAGRAPH,
+                        children=lines,
+                    )
+                ],
+            )
+
+        merged = merge_manga_ocr_pages(
+            [make_page([title_one, right]), make_page([title_two, left])],
+            600,
+            1000,
+        )
+
+        self.assertEqual(
+            [
+                normalize_line_text([word.text for word in line.children])
+                for line in merged.lines
+            ],
+            ["第1章", "右の吹き出し", "左の吹き出し"],
+        )
 
     def test_filters_solid_bullets_and_aligned_checkboxes_only(self) -> None:
         image = Image.new("RGB", (500, 500), "white")
@@ -1585,3 +1744,4 @@ class PdfCreationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    merge_manga_ocr_pages,
