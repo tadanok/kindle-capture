@@ -7,11 +7,12 @@ import os
 import re
 import subprocess
 import tempfile
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from statistics import median
 
-from ocrmypdf import OcrClass, OcrElement, hookimpl
+from ocrmypdf import BoundingBox, OcrClass, OcrElement, hookimpl
 from ocrmypdf._exec import tesseract
 from ocrmypdf.builtin_plugins.tesseract_ocr import TesseractOcrEngine
 from ocrmypdf.hocrtransform import HocrParser
@@ -341,6 +342,21 @@ OCR_REVIEW_PATTERNS = (
         "ocr_symbol_fragment",
         re.compile(r"\[(?:=|[A-Za-z]{1,3})\]"),
     ),
+)
+PROGRAMMING_TEXT_RE = re.compile(
+    r"(?ix)"
+    r"(?:^|[^A-Za-z0-9_])"
+    r"(?:import|from|def|class|return|const|let|var|function|export|"
+    r"interface|system\.out|print|async|await|SELECT|INSERT|UPDATE|"
+    r"DELETE|CREATE|SQL\s+DUMP|CODE\s+BASE)"
+    r"(?:$|[^A-Za-z0-9_])"
+    r"|=>|==|!=|</?[A-Za-z]|[{}]"
+)
+COMPACT_UI_TEXT_RE = re.compile(
+    r"(?ix)^(?:editor\s+ui|user\s+question|asking\s+ai|"
+    r"ai\s+responds(?:\s+with\s+code)?|terminal|codebase|"
+    r"legacy\s+repo|function\s+logs|java\s+class|sql\s+dump|"
+    r"documentation|pull\s+request|processing|queued)$"
 )
 
 
@@ -876,7 +892,7 @@ def analyze_ocr_page(page: OcrElement) -> dict[str, float | int]:
         "character_count": character_count,
         "mean_confidence": round(mean_confidence, 2),
         "suspicious_ratio": round(suspicious_ratio, 4),
-        "score": round(score, 2),
+        "score": round(max(0.0, min(100.0, score)), 2),
     }
 
 
@@ -943,6 +959,201 @@ def filter_low_confidence_lines(page: OcrElement) -> int:
             line.children = []
             removed += 1
 
+    return removed
+
+
+def detect_manga_narrative_regions(image: Image.Image) -> list[BoundingBox]:
+    """Detect compact enclosed light/dark regions that resemble speech bubbles."""
+    working = image.convert("RGB")
+    working.thumbnail((300, 480))
+    width, height = working.size
+    get_pixels = getattr(working, "get_flattened_data", working.getdata)
+    pixels = list(get_pixels())
+    regions: list[BoundingBox] = []
+
+    def collect(mask: list[bool]) -> None:
+        seen = bytearray(width * height)
+        for start, enabled in enumerate(mask):
+            if not enabled or seen[start]:
+                continue
+            queue = [start]
+            seen[start] = 1
+            cursor = 0
+            area = 0
+            min_x = width
+            min_y = height
+            max_x = 0
+            max_y = 0
+            while cursor < len(queue):
+                index = queue[cursor]
+                cursor += 1
+                y, x = divmod(index, width)
+                area += 1
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+                for neighbor in (index - 1, index + 1, index - width, index + width):
+                    if (
+                        neighbor < 0
+                        or neighbor >= width * height
+                        or seen[neighbor]
+                        or not mask[neighbor]
+                    ):
+                        continue
+                    neighbor_y, neighbor_x = divmod(neighbor, width)
+                    if abs(neighbor_x - x) + abs(neighbor_y - y) != 1:
+                        continue
+                    seen[neighbor] = 1
+                    queue.append(neighbor)
+            box_width = max_x - min_x + 1
+            box_height = max_y - min_y + 1
+            width_ratio = box_width / width
+            height_ratio = box_height / height
+            fill_ratio = area / (box_width * box_height)
+            if (
+                area >= width * height * 0.002
+                and 0.08 <= width_ratio <= 0.50
+                and 0.05 <= height_ratio <= 0.42
+                and 0.30 <= fill_ratio <= 0.82
+            ):
+                scale_x = image.width / width
+                scale_y = image.height / height
+                regions.append(
+                    BoundingBox(
+                        min_x * scale_x,
+                        min_y * scale_y,
+                        (max_x + 1) * scale_x,
+                        (max_y + 1) * scale_y,
+                    )
+                )
+
+    collect(
+        [
+            min(pixel) >= 225 and max(pixel) - min(pixel) <= 32
+            for pixel in pixels
+        ]
+    )
+    collect([max(pixel) <= 55 for pixel in pixels])
+    return regions
+
+
+def filter_manga_non_narrative_lines(
+    page: OcrElement,
+    image: Image.Image,
+) -> int:
+    """Keep manga titles and speech-bubble text while removing screen content."""
+    if page.bbox is None or page.bbox.height <= 0:
+        return 0
+    narrative_regions = detect_manga_narrative_regions(image)
+    entries: list[
+        tuple[
+            OcrElement,
+            str,
+            float,
+            bool,
+            bool,
+            bool,
+            list[int],
+        ]
+    ] = []
+    contaminated_regions: set[int] = set()
+    for line in page.lines:
+        words = _line_words(line)
+        if not words or line.bbox is None:
+            continue
+        text = normalize_line_text([word.text for word in words])
+        normalized = unicodedata.normalize("NFKC", text)
+        visible = [character for character in normalized if not character.isspace()]
+        if not visible:
+            continue
+        relative_height = line.bbox.height / page.bbox.height
+        japanese_count = len(re.findall(f"[{JAPANESE_CHARACTER}]", normalized))
+        ascii_count = len(re.findall(r"[A-Za-z0-9]", normalized))
+        ascii_ratio = ascii_count / len(visible)
+        code_like = bool(PROGRAMMING_TEXT_RE.search(normalized))
+        compact_ui = bool(COMPACT_UI_TEXT_RE.fullmatch(normalized.strip()))
+        ascii_ui = (
+            ascii_ratio >= 0.65
+            and japanese_count <= 1
+            and relative_height < 0.04
+        )
+        center_x = (line.bbox.left + line.bbox.right) / 2
+        center_y = (line.bbox.top + line.bbox.bottom) / 2
+        region_indexes = [
+            index
+            for index, region in enumerate(narrative_regions)
+            if region.left <= center_x <= region.right
+            and region.top <= center_y <= region.bottom
+        ]
+        if code_like or compact_ui or ascii_ui:
+            contaminated_regions.update(region_indexes)
+        entries.append(
+            (
+                line,
+                normalized,
+                relative_height,
+                code_like,
+                compact_ui,
+                ascii_ui,
+                region_indexes,
+            )
+        )
+
+    removed = 0
+    for (
+        line,
+        normalized,
+        relative_height,
+        code_like,
+        compact_ui,
+        ascii_ui,
+        region_indexes,
+    ) in entries:
+        assert line.bbox is not None
+        japanese_count = len(re.findall(f"[{JAPANESE_CHARACTER}]", normalized))
+        ascii_count = len(re.findall(r"[A-Za-z0-9]", normalized))
+        visible_count = len(
+            [character for character in normalized if not character.isspace()]
+        )
+        ascii_ratio = ascii_count / visible_count if visible_count else 0.0
+        large_title = (
+            relative_height >= 0.04
+            and (
+                line.bbox.width >= line.bbox.height * 1.2
+                or japanese_count >= 2
+            )
+        )
+        title_pattern = bool(
+            re.search(r"[『「【].+[』」】]|第\s*\d+\s*[章世代]", normalized)
+        )
+        upper_title = (
+            line.bbox.top <= page.bbox.height * 0.20
+            and relative_height >= 0.025
+        )
+        inside_narrative_region = any(
+            index not in contaminated_regions for index in region_indexes
+        )
+        keep = (
+            large_title
+            or title_pattern
+            or upper_title
+            or inside_narrative_region
+        )
+        ascii_screen_text = (
+            ascii_ratio >= 0.65
+            and japanese_count <= 1
+            and not large_title
+        )
+        if (
+            not keep
+            or code_like
+            or compact_ui
+            or ascii_ui
+            or ascii_screen_text
+        ):
+            line.children = []
+            removed += 1
     return removed
 
 
@@ -1530,6 +1741,7 @@ def _run_hocr(
     page_number: int,
     suffix: str,
     pagesegmode: int | None,
+    languages=None,
 ) -> tuple[OcrElement, str]:
     output_hocr = input_file.with_name(
         f"{input_file.stem}.readaloud-{page_number}-{suffix}.hocr"
@@ -1541,7 +1753,7 @@ def _run_hocr(
         input_file=input_file,
         output_hocr=output_hocr,
         output_text=output_text,
-        languages=options.languages,
+        languages=languages if languages is not None else options.languages,
         engine_mode=options.tesseract.oem,
         tessconfig=options.tesseract.config,
         timeout=options.tesseract.timeout,
@@ -1554,6 +1766,312 @@ def _run_hocr(
     return (
         HocrParser(output_hocr).parse(),
         output_text.read_text(encoding="utf-8"),
+    )
+
+
+def parse_vision_ocr_output(
+    output: str,
+    image_width: int,
+    image_height: int,
+) -> tuple[OcrElement, str]:
+    """Convert the native Vision helper's normalized TSV into OCR elements."""
+    lines: list[OcrElement] = []
+    text_lines: list[str] = []
+    for raw_line in output.splitlines():
+        fields = raw_line.split("\t", 5)
+        if len(fields) != 6:
+            continue
+        try:
+            x, y, width, height, confidence = (
+                float(value) for value in fields[:5]
+            )
+        except ValueError:
+            continue
+        text = fields[5].strip()
+        if not text or not MEANINGFUL_CHARACTER_RE.search(text):
+            continue
+        left = max(0.0, min(float(image_width), x * image_width))
+        right = max(left, min(float(image_width), (x + width) * image_width))
+        top = max(
+            0.0,
+            min(float(image_height), (1.0 - y - height) * image_height),
+        )
+        bottom = max(
+            top,
+            min(float(image_height), (1.0 - y) * image_height),
+        )
+        if right <= left or bottom <= top:
+            continue
+        box = BoundingBox(left, top, right, bottom)
+        lines.append(
+            OcrElement(
+                ocr_class=OcrClass.LINE,
+                bbox=box,
+                children=[
+                    OcrElement(
+                        ocr_class=OcrClass.WORD,
+                        bbox=box,
+                        text=text,
+                        confidence=max(0.0, min(1.0, confidence)),
+                        language="ja",
+                    )
+                ],
+            )
+        )
+        text_lines.append(text)
+    large_lines = [
+        line
+        for line in lines
+        if line.bbox is not None
+        and line.bbox.height >= image_height * 0.04
+    ]
+    if (
+        len(large_lines) >= 3
+        and sum(
+            len(word.text or "")
+            for line in large_lines
+            for word in _line_words(line)
+        )
+        >= 15
+    ):
+        lines = large_lines
+        text_lines = [
+            normalize_line_text([word.text or "" for word in _line_words(line)])
+            for line in lines
+        ]
+    page = OcrElement(
+        ocr_class=OcrClass.PAGE,
+        bbox=BoundingBox(0, 0, image_width, image_height),
+        children=[
+            OcrElement(
+                ocr_class=OcrClass.PARAGRAPH,
+                children=lines,
+            )
+        ],
+    )
+    return page, "\n".join(text_lines).strip()
+
+
+def run_vision_ocr(
+    input_file: Path,
+    image_width: int,
+    image_height: int,
+) -> tuple[OcrElement, str] | None:
+    """Run the opt-in, local macOS Vision helper for manga pages."""
+    helper_value = os.environ.get("KINDLE_OCR_VISION_HELPER", "")
+    if not helper_value:
+        return None
+    try:
+        result = subprocess.run(
+            [helper_value, str(input_file)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    page, text = parse_vision_ocr_output(
+        result.stdout,
+        image_width,
+        image_height,
+    )
+    metrics = analyze_ocr_page(page)
+    if (
+        int(metrics["line_count"]) < 2
+        or int(metrics["character_count"]) < 10
+    ):
+        return None
+    return page, text
+
+
+def clean_manga_region_text(text: str) -> str:
+    """Normalize a cropped speech-bubble result and drop isolated OCR debris."""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = re.sub(r"(?<![A-Za-z0-9])Al(?![A-Za-z0-9])", "AI", normalized)
+    tokens: list[str] = []
+    for token in re.split(r"\s+", normalized):
+        token = token.strip()
+        if not token:
+            continue
+        if re.fullmatch(r"[A-Za-z]{1,2}", token) and token.upper() not in KNOWN_ACRONYMS:
+            continue
+        if not MEANINGFUL_CHARACTER_RE.search(token):
+            continue
+        tokens.append(token)
+    joined = " ".join(tokens)
+    return re.sub(
+        f"(?<=[{JAPANESE_OR_PUNCTUATION}])[ \t]+"
+        f"(?=[{JAPANESE_OR_PUNCTUATION}])",
+        "",
+        joined,
+    ).strip()
+
+
+def run_manga_region_ocr(
+    input_file: Path,
+    input_image: Image.Image,
+    options,
+    page_number: int,
+) -> tuple[OcrElement, str, int, int]:
+    """OCR detected manga bubbles individually with vertical/horizontal models."""
+    regions = detect_manga_narrative_regions(input_image)
+    accepted_lines: list[OcrElement] = []
+    accepted_text: list[str] = []
+    padding = max(8, round(min(input_image.size) * 0.012))
+    with tempfile.TemporaryDirectory(prefix="kindle-manga-regions-") as directory:
+        root = Path(directory)
+        for index, region in enumerate(regions):
+            crop_box = (
+                max(0, round(region.left) - padding),
+                max(0, round(region.top) - padding),
+                min(input_image.width, round(region.right) + padding),
+                min(input_image.height, round(region.bottom) + padding),
+            )
+            if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+                continue
+            crop = input_image.crop(crop_box).convert("RGB")
+            crop_path = root / f"region-{index:03d}.png"
+            crop.save(crop_path, format="PNG")
+            vertical = crop.height > crop.width * 1.08
+            languages = (
+                ["jpn_vert", "eng"] if vertical else ["jpn", "eng"]
+            )
+            pagesegmode = 5 if vertical else 6
+            try:
+                crop_page, crop_text = _run_hocr(
+                    crop_path,
+                    options,
+                    page_number,
+                    f"region-{index:03d}",
+                    pagesegmode,
+                    languages=languages,
+                )
+            except (OSError, subprocess.SubprocessError, UnicodeError):
+                continue
+            filter_low_confidence_lines(crop_page)
+            text = clean_manga_region_text(
+                filtered_page_text(crop_page) or crop_text
+            )
+            metrics = analyze_ocr_page(crop_page)
+            japanese_count = len(re.findall(f"[{JAPANESE_CHARACTER}]", text))
+            if (
+                japanese_count < 2
+                or len(text) < 2
+                or float(metrics["mean_confidence"]) < 0.20
+                or float(metrics["suspicious_ratio"]) > 0.35
+                or PROGRAMMING_TEXT_RE.search(text)
+            ):
+                continue
+            box = BoundingBox(*crop_box)
+            accepted_lines.append(
+                OcrElement(
+                    ocr_class=OcrClass.LINE,
+                    bbox=box,
+                    children=[
+                        OcrElement(
+                            ocr_class=OcrClass.WORD,
+                            bbox=box,
+                            text=text,
+                            confidence=float(metrics["mean_confidence"]),
+                            language="ja",
+                        )
+                    ],
+                )
+            )
+            accepted_text.append(text)
+    page = OcrElement(
+        ocr_class=OcrClass.PAGE,
+        bbox=BoundingBox(0, 0, input_image.width, input_image.height),
+        children=[
+            OcrElement(
+                ocr_class=OcrClass.PARAGRAPH,
+                children=accepted_lines,
+            )
+        ],
+    )
+    return page, "\n".join(accepted_text), len(regions), len(accepted_lines)
+
+
+def filter_manga_vision_titles(page: OcrElement) -> int:
+    """Retain only explicit or upper-page titles from full-page Vision OCR."""
+    if page.bbox is None or page.bbox.height <= 0:
+        return 0
+    removed = 0
+    for line in page.lines:
+        words = _line_words(line)
+        if not words or line.bbox is None:
+            continue
+        text = normalize_line_text([word.text for word in words])
+        normalized = unicodedata.normalize("NFKC", text)
+        relative_height = line.bbox.height / page.bbox.height
+        japanese_count = len(
+            re.findall(f"[{JAPANESE_CHARACTER}]", normalized)
+        )
+        title_pattern = bool(
+            re.search(r"[『「【].+[』」】]|第\s*\d+\s*[章世代]", normalized)
+        )
+        upper_title = (
+            line.bbox.top <= page.bbox.height * 0.20
+            and relative_height >= 0.025
+            and japanese_count >= 2
+            and len(normalized) <= 100
+        )
+        if not (title_pattern or upper_title):
+            line.children = []
+            removed += 1
+    return removed
+
+
+def merge_manga_ocr_pages(
+    pages: list[OcrElement],
+    image_width: int,
+    image_height: int,
+) -> OcrElement:
+    """Merge title and bubble OCR, remove duplicates, and apply manga order."""
+    lines: list[OcrElement] = []
+    normalized_texts: list[str] = []
+    for page in pages:
+        for line in page.lines:
+            words = _line_words(line)
+            if not words or line.bbox is None:
+                continue
+            text = normalize_line_text([word.text for word in words])
+            comparable = re.sub(r"\W+", "", unicodedata.normalize("NFKC", text))
+            if not comparable:
+                continue
+            if any(
+                comparable == existing
+                or (
+                    len(comparable) >= 6
+                    and (
+                        comparable in existing
+                        or existing in comparable
+                    )
+                )
+                for existing in normalized_texts
+            ):
+                continue
+            normalized_texts.append(comparable)
+            lines.append(line)
+    band_height = max(1.0, image_height * 0.08)
+    lines.sort(
+        key=lambda line: (
+            int((line.bbox.top if line.bbox is not None else image_height) / band_height),
+            -(line.bbox.left if line.bbox is not None else 0),
+        )
+    )
+    return OcrElement(
+        ocr_class=OcrClass.PAGE,
+        bbox=BoundingBox(0, 0, image_width, image_height),
+        children=[
+            OcrElement(
+                ocr_class=OcrClass.PARAGRAPH,
+                children=lines,
+            )
+        ],
     )
 
 
@@ -1599,7 +2117,12 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
         primary_metrics = analyze_ocr_page(page)
         selected_metrics = primary_metrics
         selected_mode = primary_mode
+        selected_engine = "tesseract"
         retried = False
+        manga_regions_detected = 0
+        manga_regions_accepted = 0
+        non_narrative_lines = 0
+        narrative_already_filtered = False
 
         adaptive = os.environ.get("KINDLE_OCR_ADAPTIVE", "1") == "1"
         if adaptive and should_retry_ocr(primary_metrics):
@@ -1622,6 +2145,91 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                 selected_metrics = alternate_metrics
                 selected_mode = alternate_mode
 
+        if os.environ.get("KINDLE_OCR_CONTENT_TYPE", "document") == "manga":
+            with Image.open(input_file) as input_image:
+                input_rgb = input_image.convert("RGB")
+                vision_result = run_vision_ocr(
+                    input_file,
+                    input_image.width,
+                    input_image.height,
+                )
+                manga_page, manga_text, manga_regions_detected, manga_regions_accepted = (
+                    run_manga_region_ocr(
+                        input_file,
+                        input_rgb,
+                        options,
+                        page_number,
+                    )
+                )
+                merge_pages: list[OcrElement] = []
+                vision_text = ""
+                vision_added = False
+                narrative_scope = (
+                    os.environ.get(
+                        "KINDLE_OCR_MANGA_TEXT_SCOPE",
+                        "narrative",
+                    )
+                    == "narrative"
+                )
+                if vision_result is not None:
+                    vision_page, vision_text = vision_result
+                    if narrative_scope and manga_regions_accepted:
+                        non_narrative_lines += filter_manga_vision_titles(
+                            vision_page
+                        )
+                        narrative_already_filtered = True
+                        if any(
+                            _line_words(line) for line in vision_page.lines
+                        ):
+                            merge_pages.append(vision_page)
+                            vision_added = True
+                    elif narrative_scope:
+                        non_narrative_lines += filter_manga_non_narrative_lines(
+                            vision_page,
+                            input_rgb,
+                        )
+                        narrative_already_filtered = True
+                        merge_pages.append(vision_page)
+                        vision_added = True
+                    else:
+                        merge_pages.append(vision_page)
+                        vision_added = True
+                if manga_regions_accepted:
+                    merge_pages.append(manga_page)
+                if merge_pages:
+                    page = merge_manga_ocr_pages(
+                        merge_pages,
+                        input_image.width,
+                        input_image.height,
+                    )
+                    raw_text = "\n".join(
+                        text for text in (vision_text, manga_text) if text
+                    )
+                    selected_metrics = analyze_ocr_page(page)
+                    if (
+                        vision_added
+                        and manga_regions_accepted
+                    ):
+                        selected_engine = "vision+tesseract_regions"
+                    elif manga_regions_accepted:
+                        selected_engine = "tesseract_regions"
+                    else:
+                        selected_engine = "vision"
+                    narrative_already_filtered = True
+                selected_mode = None
+
+        if (
+            os.environ.get("KINDLE_OCR_CONTENT_TYPE", "document") == "manga"
+            and os.environ.get("KINDLE_OCR_MANGA_TEXT_SCOPE", "narrative")
+            == "narrative"
+            and not narrative_already_filtered
+        ):
+            with Image.open(input_file) as input_image:
+                non_narrative_lines = filter_manga_non_narrative_lines(
+                    page,
+                    input_image.convert("RGB"),
+                )
+
         removed_lines = 0
         if os.environ.get("KINDLE_OCR_FILTER_LOW_CONFIDENCE", "1") == "1":
             removed_lines = filter_low_confidence_lines(page)
@@ -1629,7 +2237,10 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
         filtered_list_markers: list[dict[str, object]] = []
         with Image.open(input_file) as input_image:
             input_rgb = input_image.convert("RGB")
-            if os.environ.get("KINDLE_OCR_INCLUDE_FIGURES", "0") != "1":
+            if (
+                selected_engine == "tesseract"
+                and os.environ.get("KINDLE_OCR_INCLUDE_FIGURES", "0") != "1"
+            ):
                 figure_lines = filter_figure_lines(
                     page,
                     input_rgb,
@@ -1639,7 +2250,11 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                     page,
                     input_rgb,
                 )
-        reordered_elements = reorder_ocr_tree_by_position(page)
+        reordered_elements = (
+            reorder_ocr_tree_by_position(page)
+            if selected_engine == "tesseract"
+            else 0
+        )
         corrections: dict[str, int] = {}
         correction_profiles = correction_profiles_from_environment()
         if os.environ.get("KINDLE_OCR_CORRECT_COMMON_ERRORS", "1") == "1":
@@ -1648,7 +2263,7 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                 profiles=correction_profiles,
             )
         retried_lines = 0
-        if adaptive:
+        if adaptive and selected_engine == "tesseract":
             with Image.open(input_file) as input_image:
                 retried_lines = retry_review_candidate_lines(
                     page,
@@ -1673,8 +2288,12 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
             "page": page_number + 1,
             "primary_pagesegmode": primary_mode,
             "selected_pagesegmode": selected_mode,
+            "selected_engine": selected_engine,
             "retried": retried,
             "filtered_lines": removed_lines,
+            "filtered_non_narrative_lines": non_narrative_lines,
+            "manga_regions_detected": manga_regions_detected,
+            "manga_regions_accepted": manga_regions_accepted,
             "filtered_figure_lines": figure_lines,
             "filtered_list_marker_count": len(filtered_list_markers),
             "filtered_list_markers": filtered_list_markers,

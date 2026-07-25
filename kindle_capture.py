@@ -999,6 +999,44 @@ def exclude_last_captured_page(
     return removed
 
 
+def build_vision_ocr_helper(output_path: Path) -> None:
+    """Build the local macOS Vision OCR helper used only by manga mode."""
+    if sys.platform != "darwin":
+        raise RuntimeError("漫画OCRモードは現在macOSでのみ利用できます。")
+    compiler = shutil.which("clang")
+    if compiler is None:
+        raise RuntimeError(
+            "漫画OCRモードにはXcode Command Line Toolsのclangが必要です。"
+        )
+    source_path = Path(__file__).with_name("native") / "vision_ocr.m"
+    if not source_path.exists():
+        raise RuntimeError(f"Vision OCRソースが見つかりません: {source_path}")
+    result = subprocess.run(
+        [
+            compiler,
+            "-fobjc-arc",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "Vision",
+            "-framework",
+            "ImageIO",
+            "-framework",
+            "CoreGraphics",
+            str(source_path),
+            "-o",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0 or not output_path.exists():
+        detail = result.stderr.strip() or "原因不明"
+        raise RuntimeError(f"Vision OCRヘルパーをビルドできませんでした: {detail}")
+
+
 def make_pdf_searchable(
     input_pdf: Path,
     output_pdf: Path,
@@ -1019,6 +1057,8 @@ def make_pdf_searchable(
     ocr_user_word_paths: list[str] | None = None,
     filtered_text_path: Path | None = None,
     quality_report_path: Path | None = None,
+    ocr_content_type: str = "document",
+    manga_text_scope: str = "narrative",
 ) -> bool:
     """OCRmyPDF で検索可能 PDF を作成する。成功時は True、失敗時は False を返す。"""
     effective_correction_profiles = (
@@ -1055,11 +1095,17 @@ def make_pdf_searchable(
         quality_report_path.parent.mkdir(parents=True, exist_ok=True)
 
     requested_langs = [lang for lang in ocr_lang.split("+") if lang]
+    required_model_langs = list(
+        dict.fromkeys(
+            requested_langs
+            + (["jpn_vert"] if ocr_content_type == "manga" else [])
+        )
+    )
     ocr_environment = os.environ.copy()
     if ocr_model == "best":
         try:
             model_dir = resolve_best_tessdata_dir(
-                requested_langs,
+                required_model_langs,
                 configured_path=tessdata_best_dir,
             )
         except FileNotFoundError as error:
@@ -1080,7 +1126,9 @@ def make_pdf_searchable(
         installed_langs = {
             line.strip() for line in lang_result.stdout.splitlines() if line.strip()
         }
-        missing_langs = [lang for lang in requested_langs if lang not in installed_langs]
+        missing_langs = [
+            lang for lang in required_model_langs if lang not in installed_langs
+        ]
         if missing_langs:
             print(
                 "  エラー: Tesseract に以下の言語データがありません: "
@@ -1150,6 +1198,23 @@ def make_pdf_searchable(
             cleanup_staged_outputs()
             return False
 
+        if ocr_content_type == "manga":
+            if not readaloud_text_layer:
+                print(
+                    "  エラー: 漫画OCRモードには "
+                    "--pdf-text-layer readaloud が必要です。"
+                )
+                cleanup_staged_outputs()
+                return False
+            vision_helper = artifact_dir / "kindle-vision-ocr"
+            try:
+                build_vision_ocr_helper(vision_helper)
+            except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+                print(f"  エラー: {error}")
+                cleanup_staged_outputs()
+                return False
+            ocr_environment["KINDLE_OCR_VISION_HELPER"] = str(vision_helper)
+
         run_cmd = [
             str(staged_raw_text) if value == str(raw_text_path) else value
             for value in cmd
@@ -1164,6 +1229,8 @@ def make_pdf_searchable(
         run_cmd.extend([str(input_pdf), str(staged_output_pdf)])
 
         if readaloud_text_layer:
+            ocr_environment["KINDLE_OCR_CONTENT_TYPE"] = ocr_content_type
+            ocr_environment["KINDLE_OCR_MANGA_TEXT_SCOPE"] = manga_text_scope
             ocr_environment["KINDLE_OCR_ARTIFACT_DIR"] = str(artifact_dir)
             ocr_environment["KINDLE_OCR_ADAPTIVE"] = "1" if adaptive_ocr else "0"
             ocr_environment["KINDLE_OCR_FILTER_LOW_CONFIDENCE"] = (
@@ -1257,6 +1324,8 @@ def make_pdf_searchable(
                 "ocr_model": ocr_model,
                 "ocr_languages": requested_langs,
                 "ocr_layout": ocr_layout,
+                "ocr_content_type": ocr_content_type,
+                "manga_text_scope": manga_text_scope,
                 "ocr_dictionaries": (
                     ocr_dictionaries
                     if ocr_dictionaries is not None
@@ -1289,6 +1358,18 @@ def make_pdf_searchable(
                 "filtered_lines": sum(
                     int(page.get("filtered_lines", 0)) for page in quality_pages
                 ),
+                "filtered_non_narrative_lines": sum(
+                    int(page.get("filtered_non_narrative_lines", 0))
+                    for page in quality_pages
+                ),
+                "manga_regions_detected": sum(
+                    int(page.get("manga_regions_detected", 0))
+                    for page in quality_pages
+                ),
+                "manga_regions_accepted": sum(
+                    int(page.get("manga_regions_accepted", 0))
+                    for page in quality_pages
+                ),
                 "filtered_figure_lines": sum(
                     int(page.get("filtered_figure_lines", 0))
                     for page in quality_pages
@@ -1300,6 +1381,14 @@ def make_pdf_searchable(
                 "reordered_elements": sum(
                     int(page.get("reordered_elements", 0))
                     for page in quality_pages
+                ),
+                "selected_engines": dict(
+                    sorted(
+                        Counter(
+                            str(page.get("selected_engine", "tesseract"))
+                            for page in quality_pages
+                        ).items()
+                    )
                 ),
                 "retried_lines": sum(
                     int(page.get("retried_lines", 0))
@@ -1498,6 +1587,24 @@ def main() -> int:
         help="本文レイアウト（デフォルト: horizontal）",
     )
     parser.add_argument(
+        "--ocr-content-type",
+        choices=["document", "manga"],
+        default="document",
+        help=(
+            "OCR対象（document: 通常書籍・既定 / "
+            "manga: 漫画向けmacOS Vision併用）"
+        ),
+    )
+    parser.add_argument(
+        "--manga-text-scope",
+        choices=["narrative", "all"],
+        default="narrative",
+        help=(
+            "漫画OCRの対象（narrative: タイトル・吹き出しを優先して"
+            "コード/UIを除外・既定 / all: 認識した全文）"
+        ),
+    )
+    parser.add_argument(
         "--ocr-oversample",
         type=int,
         default=300,
@@ -1605,6 +1712,11 @@ def main() -> int:
         parser.error("--pdf-dpi は 1 以上で指定してください")
     if args.ocr_oversample <= 0:
         parser.error("--ocr-oversample は 1 以上で指定してください")
+    if args.ocr_content_type == "manga" and args.pdf_text_layer != "readaloud":
+        parser.error(
+            "--ocr-content-type manga は "
+            "--pdf-text-layer readaloud と組み合わせてください"
+        )
     if args.ocr_dictionary and "none" in args.ocr_dictionary:
         if len(args.ocr_dictionary) > 1:
             parser.error("--ocr-dictionary none は他の辞書と併用できません")
@@ -1656,7 +1768,20 @@ def main() -> int:
     if args.searchable and args.ocr_model == "best":
         try:
             resolve_best_tessdata_dir(
-                [language for language in args.ocr_lang.split("+") if language],
+                list(
+                    dict.fromkeys(
+                        [
+                            language
+                            for language in args.ocr_lang.split("+")
+                            if language
+                        ]
+                        + (
+                            ["jpn_vert"]
+                            if args.ocr_content_type == "manga"
+                            else []
+                        )
+                    )
+                ),
                 configured_path=args.tessdata_best_dir,
             )
         except FileNotFoundError as error:
@@ -1807,6 +1932,9 @@ def main() -> int:
         print(f"  言語: {args.ocr_lang}")
         print(f"  OCR モデル: {args.ocr_model}")
         print(f"  レイアウト: {args.ocr_layout}")
+        print(f"  OCR対象: {args.ocr_content_type}")
+        if args.ocr_content_type == "manga":
+            print(f"  漫画テキスト範囲: {args.manga_text_scope}")
         print(f"  PDF テキスト層: {args.pdf_text_layer}")
         print(
             "  専門用語辞書: "
@@ -1881,6 +2009,8 @@ def main() -> int:
                 ocr_user_word_paths=args.ocr_user_words,
                 filtered_text_path=filtered_text_output,
                 quality_report_path=quality_report_output,
+                ocr_content_type=args.ocr_content_type,
+                manga_text_scope=args.manga_text_scope,
             ):
                 print(f"検索可能 PDF を保存しました: {searchable_output.resolve()}")
                 print(f"OCR 生テキストを保存しました: {raw_text_output.resolve()}")
