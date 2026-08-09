@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,13 +11,13 @@ from PIL import Image, ImageDraw
 from kindle_capture_support.book_corrections import (
     RAG_ACCURACY_BOOK_CORRECTIONS,
 )
+from kindle_capture_support.correction_rules import OCR_CORRECTION_RULES
 from kindle_capture_support.ocr_plugin import (
-    GENERIC_OCR_CORRECTIONS,
     analyze_ocr_page,
-    apply_common_ocr_corrections,
+    apply_ocr_corrections,
     choose_alternate_pagesegmode,
     clean_manga_region_text,
-    correct_common_ocr_misrecognitions,
+    correct_ocr_misrecognitions,
     filter_figure_lines,
     filter_list_marker_words,
     filter_low_confidence_lines,
@@ -33,8 +34,14 @@ from kindle_capture_support.ocr_plugin import (
     should_retry_ocr,
 )
 from kindle_capture_support.ocr_config import expand_correction_profiles
+from kindle_capture_support import install_ocr_models
+from kindle_capture_support.ocr_runner import (
+    find_post_ocr_candidates,
+    load_ocr_user_words,
+    resolve_best_tessdata_dir,
+)
 from ocrmypdf import BoundingBox, OcrClass, OcrElement
-from kindle_capture import (
+from kindle_capture_support.app import (
     auto_title_output_paths,
     confirm_output_overwrite,
     create_readaloud_text,
@@ -42,14 +49,11 @@ from kindle_capture import (
     detect_dark_left_ui_boundary,
     detect_dark_right_ui_boundary,
     exclude_last_captured_page,
-    find_post_ocr_candidates,
     infer_book_title,
-    load_ocr_user_words,
     main,
     normalize_ocr_text_for_reading,
     parse_page_ranges,
     resolve_output_paths,
-    resolve_best_tessdata_dir,
     save_images_as_pdf,
     sanitize_book_title_for_filename,
 )
@@ -259,19 +263,19 @@ class WorkflowSafetyTests(unittest.TestCase):
             with (
                 patch("sys.argv", arguments),
                 patch(
-                    "kindle_capture.get_kindle_window_bounds",
+                    "kindle_capture_support.app.get_kindle_window_bounds",
                     return_value=(0, 0, 240, 320),
                 ),
                 patch(
-                    "kindle_capture.take_screenshot",
+                    "kindle_capture_support.app.take_screenshot",
                     return_value=self.sample_page(),
                 ),
-                patch("kindle_capture.activate_kindle_window", return_value=True),
+                patch("kindle_capture_support.app.activate_kindle_window", return_value=True),
                 patch(
-                    "kindle_capture.try_turn_page_and_wait",
+                    "kindle_capture_support.app.try_turn_page_and_wait",
                     side_effect=pyautogui.FailSafeException(),
                 ),
-                patch("kindle_capture.subprocess.run"),
+                patch("kindle_capture_support.app.subprocess.run"),
             ):
                 exit_code = main()
 
@@ -296,23 +300,23 @@ class WorkflowSafetyTests(unittest.TestCase):
             with (
                 patch("sys.argv", arguments),
                 patch(
-                    "kindle_capture.get_kindle_window_bounds",
+                    "kindle_capture_support.app.get_kindle_window_bounds",
                     return_value=(0, 0, 240, 320),
                 ),
                 patch(
-                    "kindle_capture.take_screenshot",
+                    "kindle_capture_support.app.take_screenshot",
                     return_value=self.sample_page(),
                 ),
-                patch("kindle_capture.activate_kindle_window", return_value=True),
+                patch("kindle_capture_support.app.activate_kindle_window", return_value=True),
                 patch(
-                    "kindle_capture.try_turn_page_and_wait",
+                    "kindle_capture_support.app.try_turn_page_and_wait",
                     return_value=None,
                 ),
                 patch(
-                    "kindle_capture.exclude_last_captured_page",
+                    "kindle_capture_support.app.exclude_last_captured_page",
                     return_value=None,
                 ) as exclude_last,
-                patch("kindle_capture.subprocess.run"),
+                patch("kindle_capture_support.app.subprocess.run"),
             ):
                 exit_code = main()
 
@@ -339,23 +343,23 @@ class WorkflowSafetyTests(unittest.TestCase):
             with (
                 patch("sys.argv", arguments),
                 patch(
-                    "kindle_capture.get_kindle_window_bounds",
+                    "kindle_capture_support.app.get_kindle_window_bounds",
                     return_value=(0, 0, 240, 320),
                 ),
                 patch(
-                    "kindle_capture.take_screenshot",
+                    "kindle_capture_support.app.take_screenshot",
                     return_value=self.sample_page(),
                 ),
-                patch("kindle_capture.activate_kindle_window", return_value=True),
+                patch("kindle_capture_support.app.activate_kindle_window", return_value=True),
                 patch(
-                    "kindle_capture.try_turn_page_and_wait",
+                    "kindle_capture_support.app.try_turn_page_and_wait",
                     return_value=None,
                 ),
                 patch(
-                    "kindle_capture.exclude_last_captured_page",
+                    "kindle_capture_support.app.exclude_last_captured_page",
                     return_value=None,
                 ) as exclude_last,
-                patch("kindle_capture.subprocess.run"),
+                patch("kindle_capture_support.app.subprocess.run"),
             ):
                 exit_code = main()
 
@@ -384,24 +388,24 @@ class WorkflowSafetyTests(unittest.TestCase):
             with (
                 patch("sys.argv", arguments),
                 patch(
-                    "kindle_capture.get_kindle_window_bounds",
+                    "kindle_capture_support.app.get_kindle_window_bounds",
                     return_value=(0, 0, 240, 320),
                 ),
                 patch(
-                    "kindle_capture.take_screenshot",
+                    "kindle_capture_support.app.take_screenshot",
                     return_value=self.sample_page(),
                 ),
-                patch("kindle_capture.activate_kindle_window", return_value=True),
+                patch("kindle_capture_support.app.activate_kindle_window", return_value=True),
                 patch(
-                    "kindle_capture.try_turn_page_and_wait",
+                    "kindle_capture_support.app.try_turn_page_and_wait",
                     return_value=None,
                 ),
-                patch("kindle_capture.make_pdf_searchable", return_value=False),
+                patch("kindle_capture_support.app.make_pdf_searchable", return_value=False),
                 patch(
-                    "kindle_capture.exclude_last_captured_page",
+                    "kindle_capture_support.app.exclude_last_captured_page",
                     return_value=None,
                 ) as exclude_last,
-                patch("kindle_capture.subprocess.run"),
+                patch("kindle_capture_support.app.subprocess.run"),
             ):
                 exit_code = main()
 
@@ -451,7 +455,8 @@ class OcrDictionaryTests(unittest.TestCase):
                 "正常なページです。",
                 "UM を評価者として、Self-RAGLLM が判断します。",
                 "BLEU といっつた指標です。",
-            ]
+            ],
+            profiles={"ai-rag"},
         )
 
         self.assertEqual(
@@ -459,7 +464,6 @@ class OcrDictionaryTests(unittest.TestCase):
             [
                 (2, "llm_variant_um"),
                 (2, "joined_heading"),
-                (3, "confirmed_ocr_error"),
             ],
         )
 
@@ -469,16 +473,17 @@ class OcrDictionaryTests(unittest.TestCase):
                 "[Vv] 前処理",
                 "ユューザーは根拠に思実か確認する。",
                 "Anthropic が活用を提案して WET,",
-            ]
+            ],
+            profiles={"rag-accuracy-book"},
         )
 
         self.assertEqual(
             [(item["page"], item["reason"]) for item in candidates],
             [
                 (1, "checkbox_fragment"),
-                (2, "confirmed_ocr_error"),
-                (2, "confirmed_ocr_error"),
-                (3, "confirmed_ocr_error"),
+                (2, "confirmed_book_ocr_error"),
+                (2, "confirmed_book_ocr_error"),
+                (3, "confirmed_book_ocr_error"),
             ],
         )
 
@@ -1200,7 +1205,13 @@ class PdfTextLayerTests(unittest.TestCase):
         }
 
         self.assertTrue(should_accept_line_retry(original, improved))
-        self.assertFalse(should_accept_line_retry(original, still_suspicious))
+        self.assertFalse(
+            should_accept_line_retry(
+                original,
+                still_suspicious,
+                profiles={"rag-accuracy-book"},
+            )
+        )
 
     def test_normalizes_japanese_line_but_preserves_english_spaces(self) -> None:
         self.assertEqual(
@@ -1209,7 +1220,7 @@ class PdfTextLayerTests(unittest.TestCase):
         )
 
     def test_corrects_confirmed_common_ocr_errors_conservatively(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "生成 Al モデルで LIM を使い、ユュユーザーへ説明する。",
             profiles={"ai-rag"},
         )
@@ -1221,7 +1232,7 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(sum(corrections.values()), 3)
 
     def test_does_not_replace_partial_or_unrelated_tokens(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "LIMIT と lim、および Al 合金を扱う。"
         )
 
@@ -1231,12 +1242,12 @@ class PdfTextLayerTests(unittest.TestCase):
     def test_book_specific_corrections_are_opt_in(self) -> None:
         source = "LIM を使う。HIE RAG 精度改善。宮崎験監督。"
 
-        common_text, _ = correct_common_ocr_misrecognitions(source)
-        ai_text, _ = correct_common_ocr_misrecognitions(
+        common_text, _ = correct_ocr_misrecognitions(source)
+        ai_text, _ = correct_ocr_misrecognitions(
             source,
             profiles={"ai-rag"},
         )
-        book_text, _ = correct_common_ocr_misrecognitions(
+        book_text, _ = correct_ocr_misrecognitions(
             source,
             profiles={"rag-accuracy-book"},
         )
@@ -1252,23 +1263,32 @@ class PdfTextLayerTests(unittest.TestCase):
         )
 
     def test_book_specific_rules_are_physically_separate(self) -> None:
-        generic_names = {
-            name for name, _pattern, _replacement in GENERIC_OCR_CORRECTIONS
-        }
-        book_names = {
-            name
-            for name, _pattern, _replacement in RAG_ACCURACY_BOOK_CORRECTIONS
-        }
+        generic_names = {rule.name for rule in OCR_CORRECTION_RULES}
+        book_names = {rule.name for rule in RAG_ACCURACY_BOOK_CORRECTIONS}
 
         self.assertTrue(book_names)
         self.assertTrue(generic_names.isdisjoint(book_names))
+        self.assertEqual(
+            {rule.name for rule in OCR_CORRECTION_RULES if rule.profile == "common"},
+            {
+                "ユュユーザー -> ユーザー",
+                "りリリース -> リリース",
+                "ュユーザー -> ユーザー",
+                "ユュースケース -> ユースケース",
+                "ユューザー -> ユーザー",
+            },
+        )
+        self.assertEqual(
+            {rule.profile for rule in RAG_ACCURACY_BOOK_CORRECTIONS},
+            {"rag-accuracy-book"},
+        )
         self.assertEqual(
             expand_correction_profiles({"rag-accuracy-book"}),
             frozenset({"common", "ai-rag", "rag-accuracy-book"}),
         )
 
     def test_corrects_ai_terms_but_preserves_aluminum(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "Al スタートアップと Al 分野、AL 分野、OpenAl、OpenAT、Al 合金",
             profiles={"ai-rag"},
         )
@@ -1280,7 +1300,7 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(sum(corrections.values()), 5)
 
     def test_corrects_confirmed_llm_variants_by_context(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "LILM や RAG。UM を評価者とし、LLMLas-a-Judge を使う。"
             "LM で回答し、LM に渡す。LM の一般論。",
             profiles={"ai-rag"},
@@ -1294,14 +1314,14 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(sum(corrections.values()), 5)
 
     def test_corrects_confirmed_review_candidates(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "じてでておりまずすず:",
             profiles={"rag-accuracy-book"},
         )
         self.assertEqual(corrected, "しております：")
         self.assertEqual(sum(corrections.values()), 1)
 
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "AELOET, EL, FOFEY THEE] TRH ERA, データの特性",
             profiles={"rag-accuracy-book"},
         )
@@ -1312,7 +1332,7 @@ class PdfTextLayerTests(unittest.TestCase):
         )
         self.assertEqual(sum(corrections.values()), 1)
 
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "ユーザーのクニエリをチャイルドチャンジンクの埋め込みと"
             "比較レて、親ページプン親チャンクから来てまずよ」"
             "どという ? う形。",
@@ -1326,9 +1346,10 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(sum(corrections.values()), 5)
 
     def test_corrects_confirmed_residual_errors(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "自分の翼境でモニタリンググ基盤を比較レし、"
-            "検索記推論の機能をりリリースする。"
+            "検索記推論の機能をりリリースする。",
+            profiles={"rag-accuracy-book"},
         )
 
         self.assertEqual(
@@ -1339,7 +1360,7 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(sum(corrections.values()), 4)
 
     def test_corrects_newly_confirmed_readaloud_errors(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "ソツールが変更されている場合なあります。"
             "心より人歓迎します。HIE RAG 精度改善。"
             "ユューザーは根拠に思実か確認し、下がりやすぐなります。"
@@ -1361,7 +1382,7 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(sum(corrections.values()), 14)
 
     def test_corrects_confirmed_list_and_graph_artifacts(self) -> None:
-        corrected, corrections = correct_common_ocr_misrecognitions(
+        corrected, corrections = correct_ocr_misrecognitions(
             "1. _ 前処理。e _ LanceDB。宮崎験一 (会社. 創設者 )",
             profiles={"rag-accuracy-book"},
         )
@@ -1386,11 +1407,16 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        candidates = find_ocr_review_candidates(page)
+        self.assertEqual(find_ocr_review_candidates(page), [])
+
+        candidates = find_ocr_review_candidates(
+            page,
+            profiles={"rag-accuracy-book"},
+        )
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["text"], "じてでておりまずすず :")
-        self.assertIn("repeated_kana", candidates[0]["reasons"])
+        self.assertIn("repeated_book_kana", candidates[0]["reasons"])
         self.assertEqual(suspicious.children[0].text, "じてでておりまずすず :")
 
     def test_applies_correction_to_positioned_pdf_text_line(self) -> None:
@@ -1410,7 +1436,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"rag-accuracy-book"},
         )
@@ -1449,7 +1475,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"rag-accuracy-book"},
         )
@@ -1484,7 +1510,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"rag-accuracy-book"},
         )
@@ -1522,7 +1548,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"rag-accuracy-book"},
         )
@@ -1563,7 +1589,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"rag-accuracy-book"},
         )
@@ -1595,7 +1621,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"ai-rag"},
         )
@@ -1627,7 +1653,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"rag-accuracy-book"},
         )
@@ -1663,7 +1689,7 @@ class PdfTextLayerTests(unittest.TestCase):
             ],
         )
 
-        corrections = apply_common_ocr_corrections(
+        corrections = apply_ocr_corrections(
             page,
             profiles={"rag-accuracy-book"},
         )
@@ -1803,6 +1829,44 @@ class PdfCreationTests(unittest.TestCase):
             self.assertNotIn(b"/DCTDecode", pdf_bytes)
 
 
+class OcrModelInstallerTests(unittest.TestCase):
+    def test_downloads_and_verifies_pinned_model(self) -> None:
+        payload = b"pinned-model"
+        checksum = hashlib.sha256(payload).hexdigest()
+
+        def write_model(_url: str, destination: Path) -> None:
+            Path(destination).write_bytes(payload)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory)
+            with (
+                patch.dict(
+                    install_ocr_models.MODEL_SHA256,
+                    {"jpn": checksum},
+                    clear=True,
+                ),
+                patch(
+                    "kindle_capture_support.install_ocr_models.urllib.request.urlretrieve",
+                    side_effect=write_model,
+                ) as retrieve,
+            ):
+                install_ocr_models.download_model("jpn", destination)
+                install_ocr_models.download_model("jpn", destination)
+
+            self.assertEqual(
+                (destination / "jpn.traineddata").read_bytes(),
+                payload,
+            )
+            retrieve.assert_called_once()
+
+    def test_rejects_unpinned_model_language(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with self.assertRaisesRegex(ValueError, "固定済みモデルではない"):
+                install_ocr_models.download_model(
+                    "deu",
+                    Path(temporary_directory),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
-    merge_manga_ocr_pages,

@@ -29,12 +29,17 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-OCRを使う場合は、OCRmyPDF、Tesseractの言語データ、高精度モデルを準備します。
+OCRを使う場合は、Tesseractの言語データと高精度モデルを準備します。
+OCRmyPDFは上記の `requirements.txt` からPython環境へインストールされます。
 
 ```zsh
-brew install ocrmypdf tesseract-lang
+brew install ghostscript tesseract-lang
 python -m kindle_capture_support.install_ocr_models
 ```
+
+Pythonパッケージは `requirements.txt` でバージョンを固定しています。
+高精度モデルも公式 `tessdata_best` の特定コミットとSHA-256で検証するため、
+同じ入力を再取得できます。
 
 マンガOCRではmacOSのVisionも端末内で使用します。初回だけXcode Command Line Toolsをインストールしてください。
 
@@ -98,14 +103,15 @@ python kindle_capture.py --ocr-content-type manga --manga-text-scope all
 `--output` を指定しない場合、OCRした先頭5ページから書籍名を推定し、
 十分な確度がある場合は `kindle_book` の部分を書籍名に置き換えます。
 書籍名を推定できない場合は、以下の既定名を使用します。
+生成物はルートを散らかさないよう、既定では `output/` にまとめます。
 
 | ファイル | 内容 |
 | --- | --- |
-| `kindle_book.pdf` | キャプチャ画像をまとめたPDF |
-| `kindle_book_searchable.pdf` | OCRテキスト層を持つPDF |
-| `kindle_book_ocr.txt` | OCR生テキスト |
-| `kindle_book_readaloud.txt` | 読み上げ向けに整形したテキスト |
-| `kindle_book_ocr_quality.json` | ページ別のOCR品質と要確認候補 |
+| `output/kindle_book.pdf` | キャプチャ画像をまとめたPDF |
+| `output/kindle_book_searchable.pdf` | OCRテキスト層を持つPDF |
+| `output/kindle_book_ocr.txt` | OCR生テキスト |
+| `output/kindle_book_readaloud.txt` | 読み上げ向けに整形したテキスト |
+| `output/kindle_book_ocr_quality.json` | ページ別のOCR品質と要確認候補 |
 
 OCRの品質スコアは確認ページを選ぶための目安であり、文字の正しさを保証するものではありません。
 
@@ -148,6 +154,11 @@ python kindle_capture.py --no-auto-crop-ui \
 python kindle_capture.py --help
 ```
 
+ルート直下は、実行入口の `kindle_capture.py`、セットアップ用の
+`requirements.txt`、説明・ライセンス・テストだけに絞っています。
+OCRの設定、辞書、書籍別補正、macOS Vision連携などの実装詳細は
+`kindle_capture_support/` にまとめています。
+
 ## 停止方法
 
 - `Ctrl+C` を押す
@@ -164,7 +175,8 @@ Kindleで本を開き、実行元アプリの「アクセシビリティ」と�
 ### OCRに失敗する
 
 ```zsh
-brew install ocrmypdf tesseract-lang
+python -m pip install -r requirements.txt
+brew install ghostscript tesseract-lang
 python -m kindle_capture_support.install_ocr_models
 ```
 
@@ -174,7 +186,7 @@ python -m kindle_capture_support.install_ocr_models
 
 ### OCRの誤認識や欠落がある
 
-`kindle_book_ocr_quality.json` で要確認ページを探し、元画像と比較してください。マンガでは完全な自動文字起こしは難しいため、読み上げ用テキストの手直しが必要になる場合があります。
+`output/kindle_book_ocr_quality.json` で要確認ページを探し、元画像と比較してください。マンガでは完全な自動文字起こしは難しいため、読み上げ用テキストの手直しが必要になる場合があります。
 
 ## ライセンス
 

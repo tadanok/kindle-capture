@@ -20,10 +20,15 @@ from PIL import Image
 
 from kindle_capture_support.book_corrections import (
     RAG_ACCURACY_BOOK_CORRECTIONS,
-    RAG_ACCURACY_BOOK_CORRECTION_NAMES,
+    RAG_ACCURACY_BOOK_OCR_REVIEW_RULES,
+    correct_book_line_context,
+)
+from kindle_capture_support.correction_rules import (
+    OCR_CORRECTION_RULES,
+    OCR_REVIEW_RULES,
 )
 from kindle_capture_support.ocr_config import (
-    DEFAULT_CORRECT_COMMON_ERRORS,
+    DEFAULT_OCR_CORRECTIONS_ENABLED,
     DEFAULT_FILTER_LOW_CONFIDENCE,
     DEFAULT_INCLUDE_FIGURE_TEXT,
     DEFAULT_INCLUDE_LIST_MARKERS,
@@ -37,7 +42,7 @@ from kindle_capture_support.ocr_config import (
     OCR_ADAPTIVE_ENV,
     OCR_ARTIFACT_DIR_ENV,
     OCR_CONTENT_TYPE_ENV,
-    OCR_CORRECT_COMMON_ERRORS_ENV,
+    OCR_CORRECTIONS_ENABLED_ENV,
     OCR_CORRECTION_PROFILES_ENV,
     OCR_FILTER_LOW_CONFIDENCE_ENV,
     OCR_INCLUDE_FIGURES_ENV,
@@ -49,188 +54,10 @@ from kindle_capture_support.ocr_config import (
 
 MEANINGFUL_CHARACTER_RE = re.compile(f"[A-Za-z0-9{JAPANESE_CHARACTER}]")
 SAFE_PUNCTUATION = set("、。，．・：；！？「」『』（）［］【】〈〉《》〔〕｛｝.,:;!?()[]{}<>+-/%&@#'\"")
-GENERIC_OCR_CORRECTIONS = (
-    (
-        "LIM -> LLM",
-        re.compile(r"(?<![A-Za-z0-9])LIM(?![A-Za-z0-9])"),
-        "LLM",
-    ),
-    (
-        "LILM -> LLM",
-        re.compile(r"(?<![A-Za-z0-9])LILM(?![A-Za-z0-9])"),
-        "LLM",
-    ),
-    (
-        "UM -> LLM (before を評価者)",
-        re.compile(r"(?<![A-Za-z0-9])UM(?=\s*を評価者)"),
-        "LLM",
-    ),
-    (
-        "LLMLas-a-Judge -> LLM-as-a-Judge",
-        re.compile(r"(?<![A-Za-z0-9])LLMLas-a-Judge(?![A-Za-z0-9])"),
-        "LLM-as-a-Judge",
-    ),
-    (
-        "LM -> LLM (LLM context)",
-        re.compile(r"(?<![A-Za-z0-9])LM(?=\s*(?:で回答|に渡す))"),
-        "LLM",
-    ),
-    (
-        "Al -> AI (before LLM)",
-        re.compile(r"(?<![A-Za-z0-9])Al(?=\s*[・/]\s*LLM(?![A-Za-z0-9]))"),
-        "AI",
-    ),
-    (
-        "Al -> AI (after 生成)",
-        re.compile(r"(?<=生成 )Al(?![A-Za-z0-9])"),
-        "AI",
-    ),
-    (
-        "Al -> AI (AI context)",
-        re.compile(
-            r"(?<![A-Za-z0-9])Al(?=\s*(?:に|の|を|が|は|へ|で|と)?\s*"
-            r"(?:検索|サービス|エージェント|スタートアップ|分野|モデル|"
-            r"技術|システム))"
-        ),
-        "AI",
-    ),
-    (
-        "AL -> AI (before 分野)",
-        re.compile(r"(?<![A-Za-z0-9])AL(?=\s*分野)"),
-        "AI",
-    ),
-    (
-        "OpenAl/OpenAT -> OpenAI",
-        re.compile(r"(?<![A-Za-z0-9])OpenA[lT](?![A-Za-z0-9])"),
-        "OpenAI",
-    ),
-    (
-        "ユュユーザー -> ユーザー",
-        re.compile(r"ユュユーザー"),
-        "ユーザー",
-    ),
-    (
-        "本書の最初の草 -> 本書の最初の章",
-        re.compile(r"本書の最初の草"),
-        "本書の最初の章",
-    ),
-    ("徹し込む -> 流し込む", re.compile(r"徹し込む"), "流し込む"),
-    (
-        "クエリに登場しレた -> クエリに登場した",
-        re.compile(r"クエリに登場しレた"),
-        "クエリに登場した",
-    ),
-    ("ノフード間 -> ノード間", re.compile(r"ノフード間"), "ノード間"),
-    ("精統化 -> 精緻化", re.compile(r"精統化"), "精緻化"),
-    ("DeepSerach -> DeepSearch", re.compile(r"\bDeepSerach\b"), "DeepSearch"),
-    ("流輸さ -> 流暢さ", re.compile(r"流輸さ"), "流暢さ"),
-    (
-        "モニタリンググ基盤 -> モニタリング基盤",
-        re.compile(r"モニタリンググ基盤"),
-        "モニタリング基盤",
-    ),
-    (
-        "マッピングレし -> マッピングし",
-        re.compile(r"マッピングレし"),
-        "マッピングし",
-    ),
-    (
-        "検索記/刀推論 -> 検索&推論",
-        re.compile(r"検索[記刀]推論"),
-        "検索&推論",
-    ),
-    ("りリリース -> リリース", re.compile(r"りリリース"), "リリース"),
-    ("翼境 -> 環境", re.compile(r"翼境"), "環境"),
-    ("ュユーザー -> ユーザー", re.compile(r"ュユーザー"), "ユーザー"),
-    (
-        "ユュースケース -> ユースケース",
-        re.compile(r"ユュースケース"),
-        "ユースケース",
-    ),
-    ("ユューザー -> ユーザー", re.compile(r"ユューザー"), "ユーザー"),
-    ("ソツール -> ツール", re.compile(r"ソツール"), "ツール"),
-    (
-        "場合なあります -> 場合があります",
-        re.compile(r"場合なあります"),
-        "場合があります",
-    ),
-    ("人歓迎します -> 歓迎します", re.compile(r"人歓迎します"), "歓迎します"),
-    ("精度改番 -> 精度改善", re.compile(r"精度改番"), "精度改善"),
-    (
-        "根拠に思実か -> 根拠に忠実か",
-        re.compile(r"根拠に思実か"),
-        "根拠に忠実か",
-    ),
-    (
-        "下がりやすぐ -> 下がりやすく",
-        re.compile(r"下がりやすぐ"),
-        "下がりやすく",
-    ),
-    (
-        "マルチモーダレル -> マルチモーダル",
-        re.compile(r"マルチモーダレル"),
-        "マルチモーダル",
-    ),
-    (
-        "画像トナテキスト -> 画像やテキスト",
-        re.compile(r"画像トナテキスト"),
-        "画像やテキスト",
-    ),
-    (
-        "物在のよりモダン -> 現在のよりモダン",
-        re.compile(r"物在のよりモダン"),
-        "現在のよりモダン",
-    ),
-    (
-        "ブフォーマシト -> フォーマット",
-        re.compile(r"ブフォーマシト"),
-        "フォーマット",
-    ),
-    ("J udge -> Judge", re.compile(r"(?<![A-Za-z])J\s+udge\b"), "Judge"),
-    ("いっつた -> いった", re.compile(r"いっ\s*つた"), "いった"),
-    ("クニエリ -> クエリ", re.compile(r"クニエリ"), "クエリ"),
-    ("チャンジンク -> チャンク", re.compile(r"チャンジンク"), "チャンク"),
-    ("比較レて -> 比較して", re.compile(r"比較レて"), "比較して"),
-    (
-        "親チャンクノン親ドキュメント -> 親チャンク／親ドキュメント",
-        re.compile(r"親チャンクノン親ドキュメント"),
-        "親チャンク／親ドキュメント",
-    ),
-    ("BELベル -> 段落レベル", re.compile(r"BELベル"), "段落レベル"),
-    ("元の文書き。 -> 元の文書や、", re.compile(r"元の文書き。"), "元の文書や、"),
-    (
-        "親ページプン親チャンク -> 親ページ／親チャンク",
-        re.compile(r"親ページプン親チャンク"),
-        "親ページ／親チャンク",
-    ),
+ALL_OCR_CORRECTIONS = (
+    OCR_CORRECTION_RULES + RAG_ACCURACY_BOOK_CORRECTIONS
 )
-ALL_OCR_CORRECTIONS = GENERIC_OCR_CORRECTIONS + RAG_ACCURACY_BOOK_CORRECTIONS
-AI_RAG_CORRECTION_NAMES = frozenset(
-    {
-        "LIM -> LLM",
-        "LILM -> LLM",
-        "UM -> LLM (before を評価者)",
-        "LLMLas-a-Judge -> LLM-as-a-Judge",
-        "LM -> LLM (LLM context)",
-        "Al -> AI (before LLM)",
-        "Al -> AI (after 生成)",
-        "Al -> AI (AI context)",
-        "AL -> AI (before 分野)",
-        "OpenAl/OpenAT -> OpenAI",
-        "DeepSerach -> DeepSearch",
-        "クニエリ -> クエリ",
-        "チャンジンク -> チャンク",
-        "親チャンクノン親ドキュメント -> 親チャンク／親ドキュメント",
-        "親ページプン親チャンク -> 親ページ／親チャンク",
-        "J udge -> Judge",
-    }
-)
-def correction_profile_for_name(name: str) -> str:
-    if name in RAG_ACCURACY_BOOK_CORRECTION_NAMES:
-        return "rag-accuracy-book"
-    if name in AI_RAG_CORRECTION_NAMES:
-        return "ai-rag"
-    return "common"
+ALL_OCR_REVIEW_RULES = OCR_REVIEW_RULES + RAG_ACCURACY_BOOK_OCR_REVIEW_RULES
 
 
 def correction_profiles_from_environment() -> frozenset[str]:
@@ -260,26 +87,6 @@ KNOWN_ACRONYMS = {
     "SQL",
     "URL",
 }
-OCR_REVIEW_PATTERNS = (
-    (
-        "mixed_script_ending",
-        re.compile(r"[ぁ-んァ-ヶ一-龯]\s+[A-Z]{1,3}[,.:;]?$"),
-    ),
-    ("repeated_kana", re.compile(r"すず|じてでて|まずすず")),
-    (
-        "embedded_ocr_noise",
-        re.compile(
-            r"クニエリ|チャンジンク|比較レ|レポー\s*\d|"
-            r"ソツール|場合なあります|人歓迎|HIE\s+RAG|"
-            r"ユューザー|思実|やすぐ|マルチモーダレル|"
-            r"画像トナ|ブフォーマシト|宮崎験|WET,"
-        ),
-    ),
-    (
-        "ocr_symbol_fragment",
-        re.compile(r"\[(?:=|[A-Za-z]{1,3})\]"),
-    ),
-)
 PROGRAMMING_TEXT_RE = re.compile(
     r"(?ix)"
     r"(?:^|[^A-Za-z0-9_])"
@@ -352,7 +159,7 @@ def reorder_ocr_tree_by_position(page: OcrElement) -> int:
     return moved
 
 
-def correct_common_ocr_misrecognitions(
+def correct_ocr_misrecognitions(
     text: str,
     profiles: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, dict[str, int]]:
@@ -360,16 +167,16 @@ def correct_common_ocr_misrecognitions(
     corrected = text
     corrections: Counter[str] = Counter()
     active_profiles = expand_correction_profiles(profiles)
-    for name, pattern, replacement in ALL_OCR_CORRECTIONS:
-        if correction_profile_for_name(name) not in active_profiles:
+    for rule in ALL_OCR_CORRECTIONS:
+        if rule.profile not in active_profiles:
             continue
-        corrected, count = pattern.subn(replacement, corrected)
+        corrected, count = rule.pattern.subn(rule.replacement, corrected)
         if count:
-            corrections[name] += count
+            corrections[rule.name] += count
     return corrected, dict(sorted(corrections.items()))
 
 
-def apply_common_ocr_corrections(
+def apply_ocr_corrections(
     page: OcrElement,
     profiles: set[str] | frozenset[str] | None = None,
 ) -> dict[str, int]:
@@ -425,31 +232,11 @@ def apply_common_ocr_corrections(
             and previous_line_text.endswith("LLM-as-a-")
             and bool(re.fullmatch(r"J\s+udge\)", line_text))
         )
-        split_sentence_continuation = (
-            book_profile_enabled
-            and previous_line_text.endswith("構成されま")
-            and bool(re.fullmatch(r"i\s*[:：]", line_text))
-        )
-        misplaced_node_detail = (
-            book_profile_enabled
-            and line_text.startswith("(人名、組織、場所、出来事")
-            and next_line_text.startswith("e ノード:")
-        )
-        misplaced_sentence_end = (
-            book_profile_enabled
-            and line_text == "す。"
-            and next_line_text.startswith("「構造化された関係性」")
-        )
-        if (
-            split_title_continuation
-            or split_sentence_continuation
-            or misplaced_node_detail
-            or misplaced_sentence_end
-        ):
+        if split_title_continuation:
             line.children = []
             continue
 
-        corrected_text, line_corrections = correct_common_ocr_misrecognitions(
+        corrected_text, line_corrections = correct_ocr_misrecognitions(
             line_text,
             profiles=active_profiles,
         )
@@ -463,147 +250,24 @@ def apply_common_ocr_corrections(
                 "split LLM-as-a-/J udge -> LLM-as-a-Judge"
             ] = 1
         if (
-            book_profile_enabled
-            and corrected_text.endswith("構成されま")
-            and re.fullmatch(r"i\s*[:：]", next_line_text)
-        ):
-            corrected_text += "す："
-            line_corrections[
-                "split 構成されま/i : -> 構成されます："
-            ] = 1
-        if (
             ai_rag_enabled
             and re.search(r"(?<![A-Za-z0-9])Al$", corrected_text)
             and re.match(r"^の実務経験", next_line_text)
         ):
             corrected_text = re.sub(r"Al$", "AI", corrected_text)
             line_corrections["Al -> AI (before next-line の実務経験)"] = 1
-        if not book_profile_enabled:
-            if line_corrections:
-                replace_line_text(line, words, corrected_text)
-                corrections.update(line_corrections)
-            continue
-        if (
-            corrected_text.endswith("一歩を中")
-            and next_line_text.startswith("み出したい")
-        ):
-            corrected_text = corrected_text[:-1]
-            line_corrections["一歩を中/み出す -> 一歩を踏み出す"] = 1
-        if (
-            previous_line_text.endswith("一歩を中")
-            and corrected_text.startswith("み出したい")
-        ):
-            corrected_text = "踏" + corrected_text
-            line_corrections["中/み出したい -> 踏み出したい"] = 1
-        if (
-            corrected_text.endswith("なりま")
-            and next_line_text.startswith("To ARAL のブラックボックス性")
-        ):
-            corrected_text += "す。"
-            line_corrections["なりま/To ARAL -> なります。生成 AI"] = 1
-        if (
-            previous_line_text.endswith("なりま")
-            and corrected_text.startswith("To ARAL のブラックボックス性")
-        ):
-            corrected_text = re.sub(
-                r"^To ARAL の",
-                "生成 AI の",
+        if book_profile_enabled:
+            book_result = correct_book_line_context(
+                previous_line_text,
                 corrected_text,
+                next_line_text,
             )
-            line_corrections["To ARAL の -> 生成 AI の"] = 1
-        if corrected_text.endswith("定番で") and next_line_text == "Te":
-            corrected_text += "す。"
-            line_corrections["定番で/Te -> 定番です。"] = 1
-        if corrected_text == "Te" and previous_line_text.endswith("定番で"):
-            line.children = []
-            corrections["Te after 定番で -> removed"] = 1
-            continue
-        if (
-            corrected_text.endswith("と =")
-            and next_line_text.startswith("ークリッド距離")
-        ):
-            corrected_text = re.sub(r"=$", "ユ", corrected_text)
-            line_corrections["=/ークリッド -> ユークリッド"] = 1
-        if corrected_text == "WET,":
-            if previous_line_text.endswith("提案して"):
-                corrected_text = "います。"
-                line_corrections["提案して/WET, -> 提案しています。"] = 1
-            elif previous_line_text.endswith("向いて"):
-                corrected_text = "います。"
-                line_corrections["向いて/WET, -> 向いています。"] = 1
-        if (
-            previous_line_text.endswith("下がり")
-            and corrected_text.startswith("やすぐ")
-        ):
-            corrected_text = re.sub(r"^やすぐ", "やすく", corrected_text)
-            line_corrections["下がり/やすぐ -> 下がりやすく"] = 1
-        if previous_line_text.endswith("パイプライ"):
-            corrected_text, count = re.subn(
-                r"^ジ(?=です)",
-                "ン",
-                corrected_text,
-            )
-            if count:
-                line_corrections["ジ -> ン (after パイプライ)"] = count
-        if previous_line_text.endswith("とい"):
-            corrected_text, count = re.subn(
-                r"^っつた(?=自動スコア)",
-                "った",
-                corrected_text,
-            )
-            if count:
-                line_corrections["とい/っつた -> といった"] = count
-        if previous_line_text.startswith("(人名、組織、場所、出来事"):
-            if corrected_text.startswith("e ノード:"):
-                corrected_text += " " + previous_line_text
-                line_corrections[
-                    "node detail before label -> label before node detail"
-                ] = 1
-        if previous_line_text == "す。":
-            if (
-                corrected_text.startswith("「構造化された関係性」")
-                and corrected_text.endswith("特徴で")
-            ):
-                corrected_text += "す。"
-                line_corrections[
-                    "misordered sentence end -> sentence end"
-                ] = 1
-        if corrected_text.endswith("BEL") and next_line_text.startswith("ベルや"):
-            corrected_text = re.sub(r"BEL$", "段落レ", corrected_text)
-            line_corrections["BEL/ベル -> 段落レベル"] = 1
-        if corrected_text.endswith("比較レ") and next_line_text.startswith("て、"):
-            corrected_text = re.sub(r"比較レ$", "比較し", corrected_text)
-            line_corrections["比較レ/て -> 比較して"] = 1
-        if previous_line_text.endswith("来てま"):
-            corrected_text, count = re.subn(
-                r"^ずよ」どという\s*\?\s*う形",
-                "すよ」という形",
-                corrected_text,
-            )
-            if count:
-                line_corrections[
-                    "来てま/ずよどという ? う形 -> 来てますよという形"
-                ] = count
-        if (
-            previous_line_text.endswith("イメージで")
-            and re.fullmatch(r"すず?\s*[:：]", corrected_text)
-        ):
-            corrected_text = "す："
-            line_corrections["すず : -> す： (after イメージで)"] = 1
-        if (
-            corrected_text.endswith("パイプライ")
-            and not next_line_text.startswith(("ジです", "ンです"))
-        ):
-            corrected_text += "ン"
-            line_corrections[
-                "パイプライ -> パイプライン (missing continuation)"
-            ] = 1
-        if re.fullmatch(
-            r"\d+(?:\.\d+){2}\s+(?:Self-RAG|Agentic RAG|RAG-Reasoning)",
-            corrected_text,
-        ):
-            corrected_text += "："
-            line_corrections["section heading -> section heading："] = 1
+            if book_result.remove:
+                line.children = []
+                corrections.update(book_result.corrections)
+                continue
+            corrected_text = book_result.text
+            line_corrections.update(book_result.corrections)
         if not line_corrections:
             continue
 
@@ -612,7 +276,10 @@ def apply_common_ocr_corrections(
     return dict(sorted(corrections.items()))
 
 
-def find_ocr_review_candidates(page: OcrElement) -> list[dict[str, object]]:
+def find_ocr_review_candidates(
+    page: OcrElement,
+    profiles: set[str] | frozenset[str] | None = None,
+) -> list[dict[str, object]]:
     """Return suspicious surviving lines without changing their text."""
     candidates: list[dict[str, object]] = []
     for line in page.lines:
@@ -620,7 +287,7 @@ def find_ocr_review_candidates(page: OcrElement) -> list[dict[str, object]]:
         if not words:
             continue
         item = _line_metrics(line)
-        reasons = _line_review_reasons(item)
+        reasons = _line_review_reasons(item, profiles=profiles)
         if not reasons:
             continue
         candidates.append(
@@ -635,10 +302,14 @@ def find_ocr_review_candidates(page: OcrElement) -> list[dict[str, object]]:
 
 def _line_review_reasons(
     item: dict[str, float | int | str],
+    profiles: set[str] | frozenset[str] | None = None,
 ) -> list[str]:
     text = str(item["text"])
+    active_profiles = expand_correction_profiles(profiles)
     reasons = [
-        name for name, pattern in OCR_REVIEW_PATTERNS if pattern.search(text)
+        rule.reason
+        for rule in ALL_OCR_REVIEW_RULES
+        if rule.profile in active_profiles and rule.pattern.search(text)
     ]
     ending_acronym = re.search(r"\b([A-Z]{1,4})[,.:;]?$", text)
     if (
@@ -664,11 +335,12 @@ def _line_review_reasons(
 def should_accept_line_retry(
     original: dict[str, float | int | str],
     alternative: dict[str, float | int | str],
+    profiles: set[str] | frozenset[str] | None = None,
 ) -> bool:
     """Accept a line retry only when it is materially safer than the original."""
     original_text = str(original["text"])
     alternative_text = str(alternative["text"])
-    if _line_review_reasons(alternative):
+    if _line_review_reasons(alternative, profiles=profiles):
         return False
     if not re.search(f"[A-Za-z0-9{JAPANESE_CHARACTER}]", alternative_text):
         return False
@@ -686,6 +358,7 @@ def retry_review_candidate_lines(
     image: Image.Image,
     options,
     page_number: int,
+    profiles: set[str] | frozenset[str] | None = None,
 ) -> int:
     """Retry only suspicious lines using a scaled single-line crop."""
     retried = 0
@@ -695,7 +368,7 @@ def retry_review_candidate_lines(
         if not words or line.bbox is None:
             continue
         original = _line_metrics(line)
-        if not _line_review_reasons(original):
+        if not _line_review_reasons(original, profiles=profiles):
             continue
 
         line_height = max(1.0, line.bbox.bottom - line.bbox.top)
@@ -754,7 +427,11 @@ def retry_review_candidate_lines(
             key=lambda candidate: float(_line_metrics(candidate)["confidence"]),
         )
         alternative = _line_metrics(retry_line)
-        if not should_accept_line_retry(original, alternative):
+        if not should_accept_line_retry(
+            original,
+            alternative,
+            profiles=profiles,
+        ):
             continue
 
         alternative_words = _line_words(retry_line)
@@ -2205,10 +1882,10 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
         corrections: dict[str, int] = {}
         correction_profiles = correction_profiles_from_environment()
         if environment_flag(
-            OCR_CORRECT_COMMON_ERRORS_ENV,
-            DEFAULT_CORRECT_COMMON_ERRORS,
+            OCR_CORRECTIONS_ENABLED_ENV,
+            DEFAULT_OCR_CORRECTIONS_ENABLED,
         ):
-            corrections = apply_common_ocr_corrections(
+            corrections = apply_ocr_corrections(
                 page,
                 profiles=correction_profiles,
             )
@@ -2220,22 +1897,26 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                     input_image,
                     options,
                     page_number,
+                    profiles=correction_profiles,
                 )
         if (
             retried_lines
             and environment_flag(
-                OCR_CORRECT_COMMON_ERRORS_ENV,
-                DEFAULT_CORRECT_COMMON_ERRORS,
+                OCR_CORRECTIONS_ENABLED_ENV,
+                DEFAULT_OCR_CORRECTIONS_ENABLED,
             )
         ):
-            retry_corrections = apply_common_ocr_corrections(
+            retry_corrections = apply_ocr_corrections(
                 page,
                 profiles=correction_profiles,
             )
             corrections = dict(
                 sorted((Counter(corrections) + Counter(retry_corrections)).items())
             )
-        review_candidates = find_ocr_review_candidates(page)
+        review_candidates = find_ocr_review_candidates(
+            page,
+            profiles=correction_profiles,
+        )
         filtered_text = filtered_page_text(page)
         report: dict[str, object] = {
             "page": page_number + 1,
