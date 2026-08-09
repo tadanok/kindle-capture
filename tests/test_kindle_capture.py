@@ -282,6 +282,48 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue(output.is_file())
 
+    def test_output_parent_directory_is_created_before_tmp_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output" / "book.pdf"
+            arguments = [
+                "kindle_capture.py",
+                "--no-searchable",
+                "--start-delay",
+                "0",
+                "--crop-left",
+                "0",
+                "--crop-right",
+                "0",
+                "--output",
+                str(output),
+            ]
+            with (
+                patch("sys.argv", arguments),
+                patch(
+                    "kindle_capture_support.app.get_kindle_window_bounds",
+                    return_value=(0, 0, 240, 320),
+                ),
+                patch(
+                    "kindle_capture_support.app.take_screenshot",
+                    return_value=self.sample_page(),
+                ),
+                patch("kindle_capture_support.app.activate_kindle_window", return_value=True),
+                patch(
+                    "kindle_capture_support.app.try_turn_page_and_wait",
+                    return_value=None,
+                ),
+                patch(
+                    "kindle_capture_support.app.exclude_last_captured_page",
+                    return_value=None,
+                ),
+                patch("kindle_capture_support.app.subprocess.run"),
+            ):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output.parent.is_dir())
+            self.assertTrue(output.is_file())
+
     def test_natural_end_excludes_last_page_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "book.pdf"

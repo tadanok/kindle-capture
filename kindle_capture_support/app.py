@@ -1373,8 +1373,9 @@ def main() -> int:
         except FileNotFoundError as error:
             parser.error(str(error))
 
+    output_paths["output"].parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = output_paths["output"].parent / "kindle_tmp_pages"
-    tmp_dir.mkdir(exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     output_pdf = output_paths["output"]
 
     # ── ウィンドウ検出 ──
