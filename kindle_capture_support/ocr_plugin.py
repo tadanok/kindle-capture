@@ -18,17 +18,38 @@ from ocrmypdf.builtin_plugins.tesseract_ocr import TesseractOcrEngine
 from ocrmypdf.hocrtransform import HocrParser
 from PIL import Image
 
-
-JAPANESE_CHARACTER = (
-    r"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff"
-    r"\uf900-\ufaff\uff66-\uff9f"
+from kindle_capture_support.book_corrections import (
+    RAG_ACCURACY_BOOK_CORRECTIONS,
+    RAG_ACCURACY_BOOK_CORRECTION_NAMES,
 )
-JAPANESE_PUNCTUATION = r"、。，．・：；！？「」『』（）［］【】〈〉《》〔〕｛｝"
-JAPANESE_OR_PUNCTUATION = JAPANESE_CHARACTER + JAPANESE_PUNCTUATION
-PAGE_NUMBER_RE = re.compile(r"^[\s\-–—―]*\d+[\s\-–—―]*$")
+from kindle_capture_support.ocr_config import (
+    DEFAULT_CORRECT_COMMON_ERRORS,
+    DEFAULT_FILTER_LOW_CONFIDENCE,
+    DEFAULT_INCLUDE_FIGURE_TEXT,
+    DEFAULT_INCLUDE_LIST_MARKERS,
+    DEFAULT_MANGA_TEXT_SCOPE,
+    DEFAULT_OCR_ADAPTIVE,
+    DEFAULT_OCR_CONTENT_TYPE,
+    DEFAULT_OCR_CORRECTION_PROFILES,
+    JAPANESE_CHARACTER,
+    JAPANESE_OR_PUNCTUATION,
+    PAGE_NUMBER_RE,
+    OCR_ADAPTIVE_ENV,
+    OCR_ARTIFACT_DIR_ENV,
+    OCR_CONTENT_TYPE_ENV,
+    OCR_CORRECT_COMMON_ERRORS_ENV,
+    OCR_CORRECTION_PROFILES_ENV,
+    OCR_FILTER_LOW_CONFIDENCE_ENV,
+    OCR_INCLUDE_FIGURES_ENV,
+    OCR_INCLUDE_LIST_MARKERS_ENV,
+    OCR_MANGA_TEXT_SCOPE_ENV,
+    OCR_VISION_HELPER_ENV,
+    expand_correction_profiles,
+)
+
 MEANINGFUL_CHARACTER_RE = re.compile(f"[A-Za-z0-9{JAPANESE_CHARACTER}]")
 SAFE_PUNCTUATION = set("、。，．・：；！？「」『』（）［］【】〈〉《》〔〕｛｝.,:;!?()[]{}<>+-/%&@#'\"")
-COMMON_OCR_CORRECTIONS = (
+GENERIC_OCR_CORRECTIONS = (
     (
         "LIM -> LLM",
         re.compile(r"(?<![A-Za-z0-9])LIM(?![A-Za-z0-9])"),
@@ -134,11 +155,6 @@ COMMON_OCR_CORRECTIONS = (
         "場合があります",
     ),
     ("人歓迎します -> 歓迎します", re.compile(r"人歓迎します"), "歓迎します"),
-    (
-        "HIE RAG -> 第3章 RAG",
-        re.compile(r"(?<![A-Za-z])HIE(?=\s*RAG\s*精度改善)"),
-        "第3章",
-    ),
     ("精度改番 -> 精度改善", re.compile(r"精度改番"), "精度改善"),
     (
         "根拠に思実か -> 根拠に忠実か",
@@ -170,58 +186,8 @@ COMMON_OCR_CORRECTIONS = (
         re.compile(r"ブフォーマシト"),
         "フォーマット",
     ),
-    ("宮崎験 -> 宮崎駿", re.compile(r"宮崎験"), "宮崎駿"),
-    (
-        "宮崎駿一 (会社 -> 宮崎駿 — (会社",
-        re.compile(r"宮崎駿一(?=\s*\(会社)"),
-        "宮崎駿 —",
-    ),
-    (
-        "numbered-list underscore -> removed",
-        re.compile(r"(?<=\d\.)\s*_\s*(?=前処理)"),
-        " ",
-    ),
-    (
-        "_ LanceDB -> LanceDB",
-        re.compile(r"(?<![A-Za-z])_\s+(?=LanceDB\b)"),
-        "",
-    ),
-    (
-        "Hallucination) J -> Hallucination)」",
-        re.compile(r"Hallucination\)\s*J"),
-        "Hallucination)」",
-    ),
     ("J udge -> Judge", re.compile(r"(?<![A-Za-z])J\s+udge\b"), "Judge"),
     ("いっつた -> いった", re.compile(r"いっ\s*つた"), "いった"),
-    (
-        "説明 ET, -> 説明します。",
-        re.compile(r"説明\s+ET,"),
-        "説明します。",
-    ),
-    (
-        "構成されま i : -> 構成されます：",
-        re.compile(r"構成されま\s+i\s*[:：]"),
-        "構成されます：",
-    ),
-    ("です。 HF -> です。研", re.compile(r"です。\s*HF\b"), "です。研"),
-    ("完レポート -> 究レポート", re.compile(r"完レポート"), "究レポート"),
-    (
-        "整理じてでておりまずすず -> 整理しております",
-        re.compile(r"^整理じてでておりまずすず\s*[:：]"),
-        "整理しております：",
-    ),
-    (
-        "じてでておりまずすず -> しております",
-        re.compile(r"^じてでておりまずすず\s*[:：]"),
-        "しております：",
-    ),
-    (
-        "retrieval chapter sentence recovery",
-        re.compile(
-            r"^AELOET,\s*EL,\s*FOFEY\s+THEE\]\s*TRH\s+ERA,\s*データの"
-        ),
-        "をまとめます。ただし、どの手法も「万能」ではありません。データの",
-    ),
     ("クニエリ -> クエリ", re.compile(r"クニエリ"), "クエリ"),
     ("チャンジンク -> チャンク", re.compile(r"チャンジンク"), "チャンク"),
     ("比較レて -> 比較して", re.compile(r"比較レて"), "比較して"),
@@ -237,12 +203,8 @@ COMMON_OCR_CORRECTIONS = (
         re.compile(r"親ページプン親チャンク"),
         "親ページ／親チャンク",
     ),
-    (
-        "来てまずよ/という ? う形 -> 来てますよ/という形",
-        re.compile(r"来てまずよ」どという\s*\?\s*う形"),
-        "来てますよ」という形",
-    ),
 )
+ALL_OCR_CORRECTIONS = GENERIC_OCR_CORRECTIONS + RAG_ACCURACY_BOOK_CORRECTIONS
 AI_RAG_CORRECTION_NAMES = frozenset(
     {
         "LIM -> LLM",
@@ -263,39 +225,6 @@ AI_RAG_CORRECTION_NAMES = frozenset(
         "J udge -> Judge",
     }
 )
-RAG_ACCURACY_BOOK_CORRECTION_NAMES = frozenset(
-    {
-        "HIE RAG -> 第3章 RAG",
-        "宮崎験 -> 宮崎駿",
-        "宮崎駿一 (会社 -> 宮崎駿 — (会社",
-        "numbered-list underscore -> removed",
-        "_ LanceDB -> LanceDB",
-        "Hallucination) J -> Hallucination)」",
-        "説明 ET, -> 説明します。",
-        "構成されま i : -> 構成されます：",
-        "です。 HF -> です。研",
-        "完レポート -> 究レポート",
-        "整理じてでておりまずすず -> 整理しております",
-        "じてでておりまずすず -> しております",
-        "retrieval chapter sentence recovery",
-        "来てまずよ/という ? う形 -> 来てますよ/という形",
-    }
-)
-DEFAULT_CORRECTION_PROFILES = frozenset({"common"})
-
-
-def expand_correction_profiles(
-    profiles: set[str] | frozenset[str] | None,
-) -> frozenset[str]:
-    """Expand profile dependencies while keeping book-specific fixes opt-in."""
-    expanded = set(DEFAULT_CORRECTION_PROFILES if profiles is None else profiles)
-    if "rag-accuracy-book" in expanded:
-        expanded.update({"common", "ai-rag"})
-    if "ai-rag" in expanded:
-        expanded.add("common")
-    return frozenset(expanded)
-
-
 def correction_profile_for_name(name: str) -> str:
     if name in RAG_ACCURACY_BOOK_CORRECTION_NAMES:
         return "rag-accuracy-book"
@@ -305,10 +234,18 @@ def correction_profile_for_name(name: str) -> str:
 
 
 def correction_profiles_from_environment() -> frozenset[str]:
-    value = os.environ.get("KINDLE_OCR_CORRECTION_PROFILES", "common")
+    value = os.environ.get(
+        OCR_CORRECTION_PROFILES_ENV,
+        ",".join(DEFAULT_OCR_CORRECTION_PROFILES),
+    )
     return expand_correction_profiles(
         {profile.strip() for profile in value.split(",") if profile.strip()}
     )
+
+
+def environment_flag(name: str, default: bool) -> bool:
+    """Read an OCR boolean from the shared environment protocol."""
+    return os.environ.get(name, "1" if default else "0") == "1"
 
 
 KNOWN_ACRONYMS = {
@@ -423,7 +360,7 @@ def correct_common_ocr_misrecognitions(
     corrected = text
     corrections: Counter[str] = Counter()
     active_profiles = expand_correction_profiles(profiles)
-    for name, pattern, replacement in COMMON_OCR_CORRECTIONS:
+    for name, pattern, replacement in ALL_OCR_CORRECTIONS:
         if correction_profile_for_name(name) not in active_profiles:
             continue
         corrected, count = pattern.subn(replacement, corrected)
@@ -1858,7 +1795,7 @@ def run_vision_ocr(
     image_height: int,
 ) -> tuple[OcrElement, str] | None:
     """Run the opt-in, local macOS Vision helper for manga pages."""
-    helper_value = os.environ.get("KINDLE_OCR_VISION_HELPER", "")
+    helper_value = os.environ.get(OCR_VISION_HELPER_ENV, "")
     if not helper_value:
         return None
     try:
@@ -2080,7 +2017,7 @@ def _write_page_artifacts(
     text: str,
     report: dict[str, object],
 ) -> None:
-    artifact_value = os.environ.get("KINDLE_OCR_ARTIFACT_DIR", "")
+    artifact_value = os.environ.get(OCR_ARTIFACT_DIR_ENV, "")
     if not artifact_value:
         return
     artifact_dir = Path(artifact_value)
@@ -2124,7 +2061,7 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
         non_narrative_lines = 0
         narrative_already_filtered = False
 
-        adaptive = os.environ.get("KINDLE_OCR_ADAPTIVE", "1") == "1"
+        adaptive = environment_flag(OCR_ADAPTIVE_ENV, DEFAULT_OCR_ADAPTIVE)
         if adaptive and should_retry_ocr(primary_metrics):
             retried = True
             alternate_mode = choose_alternate_pagesegmode(
@@ -2145,7 +2082,7 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                 selected_metrics = alternate_metrics
                 selected_mode = alternate_mode
 
-        if os.environ.get("KINDLE_OCR_CONTENT_TYPE", "document") == "manga":
+        if os.environ.get(OCR_CONTENT_TYPE_ENV, DEFAULT_OCR_CONTENT_TYPE) == "manga":
             with Image.open(input_file) as input_image:
                 input_rgb = input_image.convert("RGB")
                 vision_result = run_vision_ocr(
@@ -2166,8 +2103,8 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                 vision_added = False
                 narrative_scope = (
                     os.environ.get(
-                        "KINDLE_OCR_MANGA_TEXT_SCOPE",
-                        "narrative",
+                        OCR_MANGA_TEXT_SCOPE_ENV,
+                        DEFAULT_MANGA_TEXT_SCOPE,
                     )
                     == "narrative"
                 )
@@ -2219,8 +2156,9 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                 selected_mode = None
 
         if (
-            os.environ.get("KINDLE_OCR_CONTENT_TYPE", "document") == "manga"
-            and os.environ.get("KINDLE_OCR_MANGA_TEXT_SCOPE", "narrative")
+            os.environ.get(OCR_CONTENT_TYPE_ENV, DEFAULT_OCR_CONTENT_TYPE)
+            == "manga"
+            and os.environ.get(OCR_MANGA_TEXT_SCOPE_ENV, DEFAULT_MANGA_TEXT_SCOPE)
             == "narrative"
             and not narrative_already_filtered
         ):
@@ -2231,7 +2169,10 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                 )
 
         removed_lines = 0
-        if os.environ.get("KINDLE_OCR_FILTER_LOW_CONFIDENCE", "1") == "1":
+        if environment_flag(
+            OCR_FILTER_LOW_CONFIDENCE_ENV,
+            DEFAULT_FILTER_LOW_CONFIDENCE,
+        ):
             removed_lines = filter_low_confidence_lines(page)
         figure_lines = 0
         filtered_list_markers: list[dict[str, object]] = []
@@ -2239,13 +2180,19 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
             input_rgb = input_image.convert("RGB")
             if (
                 selected_engine == "tesseract"
-                and os.environ.get("KINDLE_OCR_INCLUDE_FIGURES", "0") != "1"
+                and not environment_flag(
+                    OCR_INCLUDE_FIGURES_ENV,
+                    DEFAULT_INCLUDE_FIGURE_TEXT,
+                )
             ):
                 figure_lines = filter_figure_lines(
                     page,
                     input_rgb,
                 )
-            if os.environ.get("KINDLE_OCR_INCLUDE_LIST_MARKERS", "0") != "1":
+            if not environment_flag(
+                OCR_INCLUDE_LIST_MARKERS_ENV,
+                DEFAULT_INCLUDE_LIST_MARKERS,
+            ):
                 filtered_list_markers = filter_list_marker_words(
                     page,
                     input_rgb,
@@ -2257,7 +2204,10 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
         )
         corrections: dict[str, int] = {}
         correction_profiles = correction_profiles_from_environment()
-        if os.environ.get("KINDLE_OCR_CORRECT_COMMON_ERRORS", "1") == "1":
+        if environment_flag(
+            OCR_CORRECT_COMMON_ERRORS_ENV,
+            DEFAULT_CORRECT_COMMON_ERRORS,
+        ):
             corrections = apply_common_ocr_corrections(
                 page,
                 profiles=correction_profiles,
@@ -2273,7 +2223,10 @@ class ReadaloudTesseractEngine(TesseractOcrEngine):
                 )
         if (
             retried_lines
-            and os.environ.get("KINDLE_OCR_CORRECT_COMMON_ERRORS", "1") == "1"
+            and environment_flag(
+                OCR_CORRECT_COMMON_ERRORS_ENV,
+                DEFAULT_CORRECT_COMMON_ERRORS,
+            )
         ):
             retry_corrections = apply_common_ocr_corrections(
                 page,

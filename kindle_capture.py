@@ -36,6 +36,43 @@ from pathlib import Path
 from statistics import median
 from typing import cast
 
+from kindle_capture_support.ocr_config import (
+    DEFAULT_BEST_TESSDATA_DIR,
+    DEFAULT_CORRECT_COMMON_ERRORS,
+    DEFAULT_FILTER_LOW_CONFIDENCE,
+    DEFAULT_INCLUDE_FIGURE_TEXT,
+    DEFAULT_INCLUDE_LIST_MARKERS,
+    DEFAULT_MANGA_TEXT_SCOPE,
+    DEFAULT_OCR_ADAPTIVE,
+    DEFAULT_OCR_CORRECTION_PROFILES,
+    DEFAULT_OCR_CONTENT_TYPE,
+    DEFAULT_OCR_DICTIONARIES,
+    DEFAULT_OCR_DICTIONARY_DIR,
+    DEFAULT_OCR_LANGUAGE,
+    DEFAULT_OCR_LAYOUT,
+    DEFAULT_OCR_MODEL,
+    DEFAULT_OCR_OVERSAMPLE_DPI,
+    DEFAULT_PDF_TEXT_LAYER,
+    JAPANESE_OR_PUNCTUATION,
+    OCR_ADAPTIVE_ENV,
+    OCR_ARTIFACT_DIR_ENV,
+    OCR_CONTENT_TYPE_ENV,
+    OCR_CORRECT_COMMON_ERRORS_ENV,
+    OCR_CORRECTION_PROFILES_ENV,
+    OCR_FILTER_LOW_CONFIDENCE_ENV,
+    OCR_INCLUDE_FIGURES_ENV,
+    OCR_INCLUDE_LIST_MARKERS_ENV,
+    OCR_MANGA_TEXT_SCOPE_ENV,
+    OCR_TESSDATA_BEST_ENV,
+    OCR_VISION_HELPER_ENV,
+    PAGE_NUMBER_RE,
+    SUPPORT_DIR,
+    expand_correction_profiles,
+)
+
+DEFAULT_OUTPUT_NAME = "kindle_book.pdf"
+AUTO_TITLE_PAGE_LIMIT = 5
+
 # --- 依存ライブラリのチェック ---
 try:
     from PIL import Image, ImageChops
@@ -527,21 +564,6 @@ def create_sibling_temporary_path(path: Path) -> Path:
     return temporary_path
 
 
-JAPANESE_CHARACTER = (
-    r"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff"
-    r"\uf900-\ufaff\uff66-\uff9f"
-)
-JAPANESE_PUNCTUATION = r"、。，．・：；！？「」『』（）［］【】〈〉《》〔〕｛｝"
-JAPANESE_OR_PUNCTUATION = JAPANESE_CHARACTER + JAPANESE_PUNCTUATION
-PAGE_NUMBER_RE = re.compile(r"^[\s\-–—―]*\d+[\s\-–—―]*$")
-DEFAULT_BEST_TESSDATA_DIR = (
-    Path(__file__).resolve().parent / "ocr_models" / "tessdata_best"
-)
-DEFAULT_OCR_DICTIONARY_DIR = (
-    Path(__file__).resolve().parent / "ocr_dictionaries"
-)
-DEFAULT_OCR_DICTIONARIES = ("common",)
-DEFAULT_OCR_CORRECTION_PROFILES = ("common",)
 POST_OCR_SUSPICIOUS_PATTERNS = (
     ("llm_variant_lilm", re.compile(r"(?<![A-Za-z0-9])LILM(?![A-Za-z0-9])")),
     ("llm_variant_um", re.compile(r"(?<![A-Za-z0-9])UM(?=\s*を評価者)")),
@@ -596,25 +618,13 @@ def parse_page_ranges(value: str) -> set[int]:
     return pages
 
 
-def expand_ocr_correction_profiles(profiles: list[str] | None) -> list[str]:
-    """Expand correction profile dependencies for reporting and configuration."""
-    expanded = set(
-        DEFAULT_OCR_CORRECTION_PROFILES if profiles is None else profiles
-    )
-    if "rag-accuracy-book" in expanded:
-        expanded.update({"common", "ai-rag"})
-    if "ai-rag" in expanded:
-        expanded.add("common")
-    return sorted(expanded)
-
-
 def resolve_best_tessdata_dir(
     requested_languages: list[str],
     configured_path: str = "",
 ) -> Path:
     """Resolve and validate the project-local tessdata_best installation."""
     configured = configured_path or os.environ.get(
-        "KINDLE_OCR_TESSDATA_BEST",
+        OCR_TESSDATA_BEST_ENV,
         "",
     )
     directory = (
@@ -631,7 +641,7 @@ def resolve_best_tessdata_dir(
         raise FileNotFoundError(
             "高精度OCRモデルがありません: "
             f"{', '.join(missing)}\n"
-            "  セットアップ: python scripts/install_ocr_models.py"
+            "  セットアップ: python -m kindle_capture_support.install_ocr_models"
         )
     missing_configs = [
         name
@@ -642,7 +652,7 @@ def resolve_best_tessdata_dir(
         raise FileNotFoundError(
             "高精度OCRモデルの設定がありません: "
             f"{', '.join(missing_configs)}\n"
-            "  セットアップ: python scripts/install_ocr_models.py"
+            "  セットアップ: python -m kindle_capture_support.install_ocr_models"
         )
     return directory
 
@@ -884,6 +894,163 @@ def ensure_distinct_paths(named_paths: dict[str, Path | None]) -> None:
         seen[resolved] = name
 
 
+def sanitize_book_title_for_filename(title: str, max_bytes: int = 180) -> str:
+    """Return a filesystem-safe book title without silently changing its meaning."""
+    normalized = unicodedata.normalize("NFKC", title)
+    normalized = re.sub(r"[\x00-\x1f\x7f<>:\"/\\|?*]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .")
+    if not normalized:
+        return ""
+
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return normalized
+    truncated = encoded[:max_bytes]
+    while truncated:
+        try:
+            return truncated.decode("utf-8").rstrip(" .")
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    return ""
+
+
+def infer_book_title(
+    ocr_text: str,
+    page_limit: int = AUTO_TITLE_PAGE_LIMIT,
+) -> tuple[str, float]:
+    """Infer a likely title from the first OCR pages and return it with confidence."""
+    pages = ocr_text.replace("\r\n", "\n").replace("\r", "\n").split("\f")
+    candidates: list[tuple[float, str, bool]] = []
+    excluded_patterns = (
+        r"^(?:第[0-9０-９一二三四五六七八九十百]+[章節部]|序章|終章|目次)$",
+        r"^(?:chapter|contents|目次)\s*[0-9０-９]*$",
+        r"^(?:https?://|www\.)",
+        r"^[0-9０-９\s./-]+$",
+    )
+
+    for page_index, page in enumerate(pages[:page_limit]):
+        lines = [
+            re.sub(r"\s+", " ", line).strip()
+            for line in page.splitlines()
+        ]
+        lines = [line for line in lines if line]
+        has_book_credit = any(
+            re.search(
+                r"(?:著|作者|訳|編|監修|出版社|出版)\s*$",
+                other_line,
+            )
+            for other_line in lines
+        )
+        for line_index, line in enumerate(lines[:20]):
+            cleaned = line.strip("『』「」【】[] ")
+            length = len(cleaned)
+            if length < 2 or length > 80:
+                continue
+            if any(
+                re.search(pattern, cleaned, re.IGNORECASE)
+                for pattern in excluded_patterns
+            ):
+                continue
+            if length > 30 and re.search(r"[。！？!?]$", cleaned):
+                continue
+
+            score = 5.0 - min(page_index, 4) * 0.75
+            score += max(0.0, 2.0 - line_index * 0.2)
+            if 4 <= length <= 40:
+                score += 2.0
+            elif length > 60:
+                score -= 2.0
+            if len(lines) <= 8:
+                score += 1.5
+            if re.search(r"[『』【】]", line):
+                score += 1.0
+            if re.search(r"(?:著|作者|訳|出版社|出版)$", cleaned):
+                score -= 3.0
+            has_title_marks = bool(re.search(r"[『』【】]", line))
+            candidates.append(
+                (score, cleaned, has_book_credit or has_title_marks)
+            )
+
+    if not candidates:
+        return "", 0.0
+    score, title, has_title_evidence = max(
+        candidates,
+        key=lambda candidate: candidate[0],
+    )
+    safe_title = sanitize_book_title_for_filename(title)
+    if not safe_title:
+        return "", 0.0
+    confidence = max(0.0, min(1.0, (score - 4.0) / 7.0))
+    if not has_title_evidence:
+        confidence = min(confidence, 0.75)
+    return safe_title, confidence
+
+
+def confirm_inferred_book_title(title: str, confidence: float) -> bool:
+    """Confirm an inferred title interactively; require high confidence otherwise."""
+    if not sys.stdin.isatty():
+        return confidence >= 0.8
+    try:
+        answer = input(
+            f"書籍名を「{title}」として保存しますか？ [Y/n]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n書籍名によるリネームを行いません。")
+        return False
+    return answer in {"", "y", "yes"}
+
+
+def auto_title_output_paths(
+    paths: dict[str, Path],
+    title: str,
+    explicitly_named: set[str] | None = None,
+) -> dict[str, Path]:
+    """Rename default-named outputs to a collision-free title-based family."""
+    explicit = explicitly_named or set()
+    suffixes = {
+        "output": ".pdf",
+        "searchable": "_searchable.pdf",
+        "ocr_text": "_ocr.txt",
+        "readaloud": "_readaloud.txt",
+        "quality": "_ocr_quality.json",
+    }
+    rename_keys = [key for key in paths if key not in explicit and key in suffixes]
+    if not rename_keys:
+        return paths
+
+    directory = paths["output"].parent
+    numbered_title = title
+    number = 2
+    source_paths = {paths[key].resolve() for key in rename_keys}
+    while any(
+        (directory / f"{numbered_title}{suffixes[key]}").exists()
+        and (
+            directory / f"{numbered_title}{suffixes[key]}"
+        ).resolve() not in source_paths
+        for key in rename_keys
+    ):
+        numbered_title = f"{title}（{number}）"
+        number += 1
+
+    updated = dict(paths)
+    completed: list[tuple[Path, Path]] = []
+    try:
+        for key in rename_keys:
+            source = paths[key]
+            if not source.exists():
+                continue
+            target = directory / f"{numbered_title}{suffixes[key]}"
+            source.replace(target)
+            updated[key] = target
+            completed.append((source, target))
+    except OSError:
+        for source, target in reversed(completed):
+            if target.exists() and not source.exists():
+                target.replace(source)
+        raise
+    return updated
+
+
 def resolve_output_paths(
     output: str,
     searchable: bool,
@@ -1008,7 +1175,7 @@ def build_vision_ocr_helper(output_path: Path) -> None:
         raise RuntimeError(
             "漫画OCRモードにはXcode Command Line Toolsのclangが必要です。"
         )
-    source_path = Path(__file__).with_name("native") / "vision_ocr.m"
+    source_path = SUPPORT_DIR / "native" / "vision_ocr.m"
     if not source_path.exists():
         raise RuntimeError(f"Vision OCRソースが見つかりません: {source_path}")
     result = subprocess.run(
@@ -1042,27 +1209,27 @@ def make_pdf_searchable(
     output_pdf: Path,
     raw_text_path: Path,
     ocr_lang: str,
-    ocr_layout: str = "auto",
-    oversample_dpi: int = 300,
+    ocr_layout: str = DEFAULT_OCR_LAYOUT,
+    oversample_dpi: int = DEFAULT_OCR_OVERSAMPLE_DPI,
     readaloud_text_layer: bool = True,
-    ocr_model: str = "best",
+    ocr_model: str = DEFAULT_OCR_MODEL,
     tessdata_best_dir: str = "",
-    adaptive_ocr: bool = True,
-    filter_low_confidence: bool = True,
-    correct_common_ocr_errors: bool = True,
-    include_figure_text: bool = False,
-    include_list_markers: bool = False,
+    adaptive_ocr: bool = DEFAULT_OCR_ADAPTIVE,
+    filter_low_confidence: bool = DEFAULT_FILTER_LOW_CONFIDENCE,
+    correct_common_ocr_errors: bool = DEFAULT_CORRECT_COMMON_ERRORS,
+    include_figure_text: bool = DEFAULT_INCLUDE_FIGURE_TEXT,
+    include_list_markers: bool = DEFAULT_INCLUDE_LIST_MARKERS,
     correction_profiles: list[str] | None = None,
     ocr_dictionaries: list[str] | None = None,
     ocr_user_word_paths: list[str] | None = None,
     filtered_text_path: Path | None = None,
     quality_report_path: Path | None = None,
-    ocr_content_type: str = "document",
-    manga_text_scope: str = "narrative",
+    ocr_content_type: str = DEFAULT_OCR_CONTENT_TYPE,
+    manga_text_scope: str = DEFAULT_MANGA_TEXT_SCOPE,
 ) -> bool:
     """OCRmyPDF で検索可能 PDF を作成する。成功時は True、失敗時は False を返す。"""
-    effective_correction_profiles = (
-        expand_ocr_correction_profiles(correction_profiles)
+    effective_correction_profiles = sorted(
+        expand_correction_profiles(correction_profiles)
     )
     try:
         ensure_distinct_paths(
@@ -1134,7 +1301,8 @@ def make_pdf_searchable(
                 "  エラー: Tesseract に以下の言語データがありません: "
                 f"{', '.join(missing_langs)}\n"
                 + (
-                    "  セットアップ: python scripts/install_ocr_models.py"
+                    "  セットアップ: "
+                    "python -m kindle_capture_support.install_ocr_models"
                     if ocr_model == "best"
                     else "  インストール例: brew install tesseract-lang"
                 )
@@ -1158,11 +1326,16 @@ def make_pdf_searchable(
     if ocr_model == "best":
         cmd.extend(["--tesseract-oem", "1"])
     if readaloud_text_layer:
-        plugin_path = Path(__file__).with_name("ocr_readaloud_plugin.py").resolve()
+        plugin_path = SUPPORT_DIR / "ocr_plugin.py"
         if not plugin_path.exists():
             print(f"  エラー: OCR プラグインが見つかりません: {plugin_path}")
             return False
         cmd.extend(["--plugin", str(plugin_path)])
+        project_root = str(SUPPORT_DIR.parent)
+        existing_python_path = ocr_environment.get("PYTHONPATH", "")
+        ocr_environment["PYTHONPATH"] = os.pathsep.join(
+            value for value in (project_root, existing_python_path) if value
+        )
     page_segmentation_modes = {"horizontal": "6", "vertical": "5"}
     if ocr_layout in page_segmentation_modes:
         cmd.extend(
@@ -1213,7 +1386,7 @@ def make_pdf_searchable(
                 print(f"  エラー: {error}")
                 cleanup_staged_outputs()
                 return False
-            ocr_environment["KINDLE_OCR_VISION_HELPER"] = str(vision_helper)
+            ocr_environment[OCR_VISION_HELPER_ENV] = str(vision_helper)
 
         run_cmd = [
             str(staged_raw_text) if value == str(raw_text_path) else value
@@ -1229,23 +1402,23 @@ def make_pdf_searchable(
         run_cmd.extend([str(input_pdf), str(staged_output_pdf)])
 
         if readaloud_text_layer:
-            ocr_environment["KINDLE_OCR_CONTENT_TYPE"] = ocr_content_type
-            ocr_environment["KINDLE_OCR_MANGA_TEXT_SCOPE"] = manga_text_scope
-            ocr_environment["KINDLE_OCR_ARTIFACT_DIR"] = str(artifact_dir)
-            ocr_environment["KINDLE_OCR_ADAPTIVE"] = "1" if adaptive_ocr else "0"
-            ocr_environment["KINDLE_OCR_FILTER_LOW_CONFIDENCE"] = (
+            ocr_environment[OCR_CONTENT_TYPE_ENV] = ocr_content_type
+            ocr_environment[OCR_MANGA_TEXT_SCOPE_ENV] = manga_text_scope
+            ocr_environment[OCR_ARTIFACT_DIR_ENV] = str(artifact_dir)
+            ocr_environment[OCR_ADAPTIVE_ENV] = "1" if adaptive_ocr else "0"
+            ocr_environment[OCR_FILTER_LOW_CONFIDENCE_ENV] = (
                 "1" if filter_low_confidence else "0"
             )
-            ocr_environment["KINDLE_OCR_CORRECT_COMMON_ERRORS"] = (
+            ocr_environment[OCR_CORRECT_COMMON_ERRORS_ENV] = (
                 "1" if correct_common_ocr_errors else "0"
             )
-            ocr_environment["KINDLE_OCR_CORRECTION_PROFILES"] = ",".join(
+            ocr_environment[OCR_CORRECTION_PROFILES_ENV] = ",".join(
                 effective_correction_profiles
             )
-            ocr_environment["KINDLE_OCR_INCLUDE_FIGURES"] = (
+            ocr_environment[OCR_INCLUDE_FIGURES_ENV] = (
                 "1" if include_figure_text else "0"
             )
-            ocr_environment["KINDLE_OCR_INCLUDE_LIST_MARKERS"] = (
+            ocr_environment[OCR_INCLUDE_LIST_MARKERS_ENV] = (
                 "1" if include_list_markers else "0"
             )
 
@@ -1449,7 +1622,7 @@ def main() -> int:
     )
     parser.add_argument(
         "-o", "--output",
-        default="kindle_book.pdf",
+        default=None,
         help="出力 PDF ファイル名（デフォルト: kindle_book.pdf）",
     )
     parser.add_argument(
@@ -1566,13 +1739,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--ocr-lang",
-        default="jpn+eng",
+        default=DEFAULT_OCR_LANGUAGE,
         help="OCR 言語（ocrmypdf -l に渡す値。デフォルト: jpn+eng）",
     )
     parser.add_argument(
         "--ocr-model",
         choices=["best", "standard"],
-        default="best",
+        default=DEFAULT_OCR_MODEL,
         help="OCR モデル（best: 高精度・既定 / standard: 標準・高速）",
     )
     parser.add_argument(
@@ -1583,13 +1756,13 @@ def main() -> int:
     parser.add_argument(
         "--ocr-layout",
         choices=["auto", "horizontal", "vertical"],
-        default="horizontal",
+        default=DEFAULT_OCR_LAYOUT,
         help="本文レイアウト（デフォルト: horizontal）",
     )
     parser.add_argument(
         "--ocr-content-type",
         choices=["document", "manga"],
-        default="document",
+        default=DEFAULT_OCR_CONTENT_TYPE,
         help=(
             "OCR対象（document: 通常書籍・既定 / "
             "manga: 漫画向けmacOS Vision併用）"
@@ -1598,7 +1771,7 @@ def main() -> int:
     parser.add_argument(
         "--manga-text-scope",
         choices=["narrative", "all"],
-        default="narrative",
+        default=DEFAULT_MANGA_TEXT_SCOPE,
         help=(
             "漫画OCRの対象（narrative: タイトル・吹き出しを優先して"
             "コード/UIを除外・既定 / all: 認識した全文）"
@@ -1607,7 +1780,7 @@ def main() -> int:
     parser.add_argument(
         "--ocr-oversample",
         type=int,
-        default=300,
+        default=DEFAULT_OCR_OVERSAMPLE_DPI,
         help="OCR 前に補間する最低解像度（デフォルト: 300）",
     )
     parser.add_argument(
@@ -1673,7 +1846,7 @@ def main() -> int:
     parser.add_argument(
         "--pdf-text-layer",
         choices=["readaloud", "standard"],
-        default="readaloud",
+        default=DEFAULT_PDF_TEXT_LAYER,
         help="検索可能 PDF のテキスト層（デフォルト: readaloud）",
     )
     parser.add_argument(
@@ -1687,6 +1860,13 @@ def main() -> int:
         type=int,
         default=2,
         help="ページ送り失敗時のリトライ回数（デフォルト: 2）",
+    )
+    parser.set_defaults(
+        ocr_adaptive=DEFAULT_OCR_ADAPTIVE,
+        filter_low_confidence=DEFAULT_FILTER_LOW_CONFIDENCE,
+        correct_common_ocr_errors=DEFAULT_CORRECT_COMMON_ERRORS,
+        include_figure_text=DEFAULT_INCLUDE_FIGURE_TEXT,
+        include_list_markers=DEFAULT_INCLUDE_LIST_MARKERS,
     )
     args = parser.parse_args()
 
@@ -1753,8 +1933,9 @@ def main() -> int:
     except ValueError as error:
         parser.error(f"--readaloud-skip-pages: {error}")
     try:
+        output_was_explicit = args.output is not None
         output_paths = resolve_output_paths(
-            output=args.output,
+            output=args.output or DEFAULT_OUTPUT_NAME,
             searchable=args.searchable,
             searchable_output=args.searchable_output,
             ocr_text_output=args.ocr_text_output,
@@ -2043,8 +2224,40 @@ def main() -> int:
                 )
                 print(
                     "  標準モデル: brew install ocrmypdf tesseract-lang\n"
-                    "  高精度モデル: python scripts/install_ocr_models.py"
+                    "  高精度モデル: "
+                    "python -m kindle_capture_support.install_ocr_models"
                 )
+
+        if not had_errors and not output_was_explicit:
+            try:
+                ocr_text = raw_text_output.read_text(encoding="utf-8")
+                inferred_title, title_confidence = infer_book_title(ocr_text)
+                if inferred_title and confirm_inferred_book_title(
+                    inferred_title, title_confidence
+                ):
+                    explicitly_named = {
+                        key
+                        for key, value in {
+                            "searchable": args.searchable_output,
+                            "ocr_text": args.ocr_text_output,
+                            "readaloud": args.readaloud_output,
+                            "quality": args.ocr_quality_report,
+                        }.items()
+                        if value
+                    }
+                    output_paths = auto_title_output_paths(
+                        output_paths,
+                        inferred_title,
+                        explicitly_named=explicitly_named,
+                    )
+                    output_pdf = output_paths["output"]
+                    print(f"書籍名をファイル名に設定しました: {output_pdf.name}")
+                elif not inferred_title:
+                    print("書籍名を推定できなかったため、既定のファイル名を使用します。")
+                else:
+                    print("書籍名によるリネームを行いませんでした。")
+            except (OSError, UnicodeError) as error:
+                print(f"書籍名によるリネームを行えませんでした: {error}")
 
     # ── 中間ファイルの削除 ──
     if not args.keep_images:

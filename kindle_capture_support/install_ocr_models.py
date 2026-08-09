@@ -8,6 +8,8 @@ import re
 import urllib.request
 from pathlib import Path
 
+from kindle_capture_support.ocr_config import DEFAULT_BEST_TESSDATA_DIR
+
 
 DEFAULT_LANGUAGES = ("jpn", "jpn_vert", "eng")
 MODEL_BASE_URL = (
@@ -33,14 +35,13 @@ def download_model(language: str, destination: Path, force: bool = False) -> Non
 
 
 def main() -> None:
-    project_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
         description="公式 tessdata_best OCR モデルをインストール"
     )
     parser.add_argument(
         "--destination",
         type=Path,
-        default=project_root / "ocr_models" / "tessdata_best",
+        default=DEFAULT_BEST_TESSDATA_DIR,
         help="モデルの保存先",
     )
     parser.add_argument(

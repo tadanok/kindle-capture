@@ -7,7 +7,11 @@ import pikepdf
 import pyautogui
 from PIL import Image, ImageDraw
 
-from ocr_readaloud_plugin import (
+from kindle_capture_support.book_corrections import (
+    RAG_ACCURACY_BOOK_CORRECTIONS,
+)
+from kindle_capture_support.ocr_plugin import (
+    GENERIC_OCR_CORRECTIONS,
     analyze_ocr_page,
     apply_common_ocr_corrections,
     choose_alternate_pagesegmode,
@@ -28,8 +32,10 @@ from ocr_readaloud_plugin import (
     should_accept_line_retry,
     should_retry_ocr,
 )
+from kindle_capture_support.ocr_config import expand_correction_profiles
 from ocrmypdf import BoundingBox, OcrClass, OcrElement
 from kindle_capture import (
+    auto_title_output_paths,
     confirm_output_overwrite,
     create_readaloud_text,
     detect_content_bounds,
@@ -37,6 +43,7 @@ from kindle_capture import (
     detect_dark_right_ui_boundary,
     exclude_last_captured_page,
     find_post_ocr_candidates,
+    infer_book_title,
     load_ocr_user_words,
     main,
     normalize_ocr_text_for_reading,
@@ -44,6 +51,7 @@ from kindle_capture import (
     resolve_output_paths,
     resolve_best_tessdata_dir,
     save_images_as_pdf,
+    sanitize_book_title_for_filename,
 )
 
 
@@ -106,6 +114,43 @@ class ContentBoundsTests(unittest.TestCase):
 
 
 class OutputSafetyTests(unittest.TestCase):
+    def test_infers_title_from_sparse_opening_page(self) -> None:
+        title, confidence = infer_book_title(
+            "生成AI時代の検索システム\n山田太郎 著\f第1章\nはじめに"
+        )
+
+        self.assertEqual(title, "生成AI時代の検索システム")
+        self.assertGreaterEqual(confidence, 0.8)
+
+    def test_does_not_treat_chapter_heading_as_book_title(self) -> None:
+        title, confidence = infer_book_title("第1章\n本文です。")
+
+        self.assertNotEqual(title, "第1章")
+        self.assertLess(confidence, 0.8)
+
+    def test_sanitizes_title_for_filename(self) -> None:
+        self.assertEqual(
+            sanitize_book_title_for_filename('本の題名: "入門/実践"'),
+            "本の題名 入門 実践",
+        )
+
+    def test_renames_default_outputs_and_avoids_existing_family(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = resolve_output_paths(str(root / "kindle_book.pdf"), True)
+            for path in paths.values():
+                path.write_text("generated", encoding="utf-8")
+            (root / "書籍名.pdf").write_text("existing", encoding="utf-8")
+
+            renamed = auto_title_output_paths(paths, "書籍名")
+
+            self.assertEqual(renamed["output"].name, "書籍名（2）.pdf")
+            self.assertTrue(all(path.exists() for path in renamed.values()))
+            self.assertEqual(
+                (root / "書籍名.pdf").read_text(encoding="utf-8"),
+                "existing",
+            )
+
     def test_resolves_distinct_outputs_with_expected_extensions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "book.pdf"
@@ -1204,6 +1249,22 @@ class PdfTextLayerTests(unittest.TestCase):
         self.assertEqual(
             book_text,
             "LLM を使う。第3章 RAG 精度改善。宮崎駿監督。",
+        )
+
+    def test_book_specific_rules_are_physically_separate(self) -> None:
+        generic_names = {
+            name for name, _pattern, _replacement in GENERIC_OCR_CORRECTIONS
+        }
+        book_names = {
+            name
+            for name, _pattern, _replacement in RAG_ACCURACY_BOOK_CORRECTIONS
+        }
+
+        self.assertTrue(book_names)
+        self.assertTrue(generic_names.isdisjoint(book_names))
+        self.assertEqual(
+            expand_correction_profiles({"rag-accuracy-book"}),
+            frozenset({"common", "ai-rag", "rag-accuracy-book"}),
         )
 
     def test_corrects_ai_terms_but_preserves_aluminum(self) -> None:

@@ -33,7 +33,7 @@ OCRを使う場合は、OCRmyPDF、Tesseractの言語データ、高精度モデ
 
 ```zsh
 brew install ocrmypdf tesseract-lang
-python scripts/install_ocr_models.py
+python -m kindle_capture_support.install_ocr_models
 ```
 
 マンガOCRではmacOSのVisionも端末内で使用します。初回だけXcode Command Line Toolsをインストールしてください。
@@ -95,6 +95,10 @@ python kindle_capture.py --ocr-content-type manga --manga-text-scope all
 
 既定では次のファイルを作成します。
 
+`--output` を指定しない場合、OCRした先頭5ページから書籍名を推定し、
+十分な確度がある場合は `kindle_book` の部分を書籍名に置き換えます。
+書籍名を推定できない場合は、以下の既定名を使用します。
+
 | ファイル | 内容 |
 | --- | --- |
 | `kindle_book.pdf` | キャプチャ画像をまとめたPDF |
@@ -135,6 +139,9 @@ python kindle_capture.py --no-auto-crop-ui \
   --crop-left 60 --crop-right 60 --crop-bottom 40
 ```
 
+`rag-accuracy-book` 補正プロファイルは、特定書籍で確認した誤認識だけを
+修正するためのオプトイン設定です。既定の `common` 処理には適用されません。
+
 すべてのオプションは次のコマンドで確認できます。
 
 ```zsh
@@ -158,7 +165,7 @@ Kindleで本を開き、実行元アプリの「アクセシビリティ」と�
 
 ```zsh
 brew install ocrmypdf tesseract-lang
-python scripts/install_ocr_models.py
+python -m kindle_capture_support.install_ocr_models
 ```
 
 ### 不要なUIやページ番号が残る
